@@ -12,11 +12,12 @@ app.use(express.json());
 const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const TELEGRAM_SYNC_SECRET = process.env.TELEGRAM_SYNC_SECRET;
 const PORT = process.env.PORT || 3000;
 
-// Supabase client
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Supabase client (for sync operations)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // Map of Telegram clients (one per bot)
 const telegramClients = new Map();
@@ -244,21 +245,27 @@ async function disconnectBot(botId) {
   }
 }
 
-// Load and connect all bots from Supabase
+// Load and connect all bots via Edge Function
 async function loadAndConnectBots() {
-  console.log('📋 Carregando bots do Supabase...');
+  console.log('📋 Carregando bots via Edge Function...');
 
-  const { data: bots, error } = await supabase
-    .from('bots_black')
-    .select('id, nome, api_token, ativo')
-    .eq('ativo', true);
+  try {
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/telegram-bots-list`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-sync-secret': TELEGRAM_SYNC_SECRET
+      }
+    });
 
-  if (error) {
-    console.error('Erro ao buscar bots:', error);
-    return;
-  }
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Erro ao buscar bots:', response.status, errorText);
+      return;
+    }
 
-  console.log(`📊 Encontrados ${bots.length} bots ativos`);
+    const { bots } = await response.json();
+    console.log(`📊 Encontrados ${bots.length} bots ativos com token`);
 
   // Connect each bot
   let connectedCount = 0;
@@ -267,7 +274,11 @@ async function loadAndConnectBots() {
     if (success) connectedCount++;
   }
 
-  console.log(`\n🚀 ${connectedCount}/${bots.length} bots conectados via MTProto`);
+    console.log(`\n🚀 ${connectedCount}/${bots.length} bots conectados via MTProto`);
+
+  } catch (error) {
+    console.error('Erro ao carregar bots:', error.message);
+  }
 }
 
 // === HTTP Endpoints ===
@@ -384,8 +395,13 @@ async function start() {
       process.exit(1);
     }
 
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-      console.error('❌ SUPABASE_URL e SUPABASE_SERVICE_KEY são obrigatórios!');
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      console.error('❌ SUPABASE_URL e SUPABASE_ANON_KEY são obrigatórios!');
+      process.exit(1);
+    }
+
+    if (!TELEGRAM_SYNC_SECRET) {
+      console.error('❌ TELEGRAM_SYNC_SECRET é obrigatório!');
       process.exit(1);
     }
 
