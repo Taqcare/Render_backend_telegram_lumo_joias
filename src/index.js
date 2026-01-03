@@ -277,6 +277,7 @@ async function loadAndConnectBots() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
         'x-sync-secret': TELEGRAM_SYNC_SECRET
       }
     });
