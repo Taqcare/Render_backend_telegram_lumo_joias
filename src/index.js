@@ -3,6 +3,7 @@ const express = require('express');
 const { TelegramClient } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json());
@@ -10,22 +11,21 @@ app.use(express.json());
 // Configuration
 const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
-const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const PORT = process.env.PORT || 3000;
 
-// Store session string for reconnection
-let sessionString = '';
-let client = null;
-let isConnected = false;
+// Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// Map of Telegram clients (one per bot)
+const telegramClients = new Map();
 
 // Helper: Convert BigInt to String safely
 function bigIntToString(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'object' && value !== null) {
-    // Handle BigInt objects
     if (value.value !== undefined && typeof value.value === 'bigint') {
       return value.value.toString();
     }
@@ -36,12 +36,9 @@ function bigIntToString(value) {
 // Helper: Extract chat ID from peer
 function extractChatId(peerId) {
   if (!peerId) return null;
-  
-  // Handle different peer types
   if (peerId.userId) return bigIntToString(peerId.userId);
   if (peerId.chatId) return bigIntToString(peerId.chatId);
   if (peerId.channelId) return bigIntToString(peerId.channelId);
-  
   return null;
 }
 
@@ -66,216 +63,359 @@ function extractSenderInfo(message) {
   };
 }
 
-// Send data to Supabase Edge Function
-async function syncToSupabase(data) {
+// Sync to Supabase directly
+async function syncToSupabase(botId, chatData, messageData) {
   try {
-    console.log('Syncing to Supabase:', JSON.stringify(data, null, 2));
-    
-    const response = await fetch(`${SUPABASE_URL}/functions/v1/telegram-mtproto-sync`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`
-      },
-      body: JSON.stringify(data)
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Supabase sync error:', response.status, errorText);
+    // Upsert chat
+    const { error: chatError } = await supabase
+      .from('telegram_chats')
+      .upsert({
+        bot_id: botId,
+        chat_id: chatData.chat_id,
+        username: chatData.username,
+        first_name: chatData.first_name,
+        last_name: chatData.last_name,
+        last_message_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'bot_id,chat_id'
+      });
+
+    if (chatError) {
+      console.error(`[Bot ${botId}] Erro ao salvar chat:`, chatError);
       return false;
     }
-    
-    const result = await response.json();
-    console.log('Supabase sync success:', result);
-    return true;
+
+    // Get saved chat ID
+    const { data: savedChat } = await supabase
+      .from('telegram_chats')
+      .select('id')
+      .eq('bot_id', botId)
+      .eq('chat_id', chatData.chat_id)
+      .single();
+
+    if (savedChat) {
+      // Insert message
+      const { error: msgError } = await supabase
+        .from('telegram_messages')
+        .upsert({
+          telegram_chat_id: savedChat.id,
+          telegram_message_id: messageData.message_id,
+          text: messageData.text,
+          direction: messageData.direction,
+          sent_at: messageData.sent_at
+        }, {
+          onConflict: 'telegram_chat_id,telegram_message_id'
+        });
+
+      if (msgError) {
+        console.error(`[Bot ${botId}] Erro ao salvar mensagem:`, msgError);
+        return false;
+      }
+
+      return true;
+    }
+
+    return false;
   } catch (error) {
-    console.error('Failed to sync to Supabase:', error.message);
+    console.error(`[Bot ${botId}] Erro na sincronização:`, error);
     return false;
   }
 }
 
-// Initialize Telegram client
-async function initializeTelegramClient() {
+// Create message handler for a specific bot
+function createMessageHandler(botId, botName) {
+  return async (event) => {
+    try {
+      const message = event.message;
+      if (!message) return;
+
+      // Extract chat ID
+      const chatId = extractChatId(message.peerId);
+      if (!chatId) return;
+
+      // Check if outgoing (bot's own message)
+      const isOutgoing = message.out === true;
+      const direction = isOutgoing ? 'outgoing' : 'incoming';
+
+      // Extract sender info
+      const senderInfo = extractSenderInfo(message);
+
+      // Log message
+      console.log(`📨 [${botName}] ${direction.toUpperCase()} | Chat: ${chatId} | ${senderInfo.firstName || 'Unknown'}: ${message.text?.substring(0, 50) || '[sem texto]'}`);
+
+      // Prepare data
+      const chatData = {
+        chat_id: parseInt(chatId),
+        username: senderInfo.username,
+        first_name: senderInfo.firstName,
+        last_name: senderInfo.lastName
+      };
+
+      const messageData = {
+        message_id: parseInt(bigIntToString(message.id)),
+        text: message.text || message.message || '',
+        direction: direction,
+        sent_at: message.date ? new Date(message.date * 1000).toISOString() : new Date().toISOString()
+      };
+
+      // Sync to Supabase
+      const success = await syncToSupabase(botId, chatData, messageData);
+      if (success) {
+        console.log(`✅ [${botName}] Mensagem sincronizada`);
+      }
+
+    } catch (error) {
+      console.error(`[${botName}] Erro ao processar mensagem:`, error);
+    }
+  };
+}
+
+// Connect a specific bot
+async function connectBot(bot) {
+  const { id: botId, nome: botName, api_token: botToken } = bot;
+
+  if (!botToken) {
+    console.log(`⚠️ [${botName}] Sem token configurado, pulando...`);
+    return false;
+  }
+
+  // Check if already connected
+  if (telegramClients.has(botId)) {
+    console.log(`ℹ️ [${botName}] Já conectado`);
+    return true;
+  }
+
   try {
-    console.log('Initializing Telegram MTProto client...');
-    console.log('API_ID:', API_ID);
-    console.log('BOT_TOKEN exists:', !!BOT_TOKEN);
-    
-    // Create client with empty session (bot doesn't need persistent session)
-    client = new TelegramClient(
-      new StringSession(sessionString),
+    console.log(`🔄 [${botName}] Conectando...`);
+
+    const client = new TelegramClient(
+      new StringSession(''),
       API_ID,
       API_HASH,
       {
         connectionRetries: 5,
         retryDelay: 1000,
-        autoReconnect: true,
-        useWSS: false // Use TCP, not WebSocket
+        autoReconnect: true
       }
     );
-    
-    // Start client with bot token (NOT phone number!)
+
     await client.start({
-      botAuthToken: BOT_TOKEN
+      botAuthToken: botToken,
     });
-    
-    console.log('✅ Connected to Telegram MTProto as bot!');
-    console.log('Session string:', client.session.save());
-    sessionString = client.session.save();
-    isConnected = true;
-    
+
     // Get bot info
     const me = await client.getMe();
-    console.log('Bot info:', {
-      id: bigIntToString(me.id),
-      username: me.username,
-      firstName: me.firstName
+    console.log(`✅ [${botName}] Conectado como @${me.username}`);
+
+    // Add message handler
+    client.addEventHandler(
+      createMessageHandler(botId, botName),
+      new NewMessage({})
+    );
+
+    // Store client
+    telegramClients.set(botId, { 
+      client, 
+      botName, 
+      botUsername: me.username,
+      connectedAt: new Date().toISOString()
     });
-    
-    // Set up message handler
-    setupMessageHandler();
-    
+
     return true;
+
   } catch (error) {
-    console.error('Failed to initialize Telegram client:', error);
-    isConnected = false;
+    console.error(`❌ [${botName}] Erro ao conectar:`, error.message);
     return false;
   }
 }
 
-// Handle incoming messages
-function setupMessageHandler() {
-  client.addEventHandler(async (event) => {
+// Disconnect a bot
+async function disconnectBot(botId) {
+  const clientInfo = telegramClients.get(botId);
+  if (clientInfo) {
     try {
-      const message = event.message;
-      
-      if (!message) {
-        console.log('Event without message:', event);
-        return;
-      }
-      
-      // Extract chat ID (CRITICAL: Convert BigInt to String!)
-      const chatId = extractChatId(message.peerId);
-      if (!chatId) {
-        console.log('Could not extract chat ID from message');
-        return;
-      }
-      
-      // Check if this is an outgoing message (bot's own message)
-      const isOutgoing = message.out === true;
-      
-      // Extract sender info
-      const senderInfo = extractSenderInfo(message);
-      
-      // Build message data object
-      const messageData = {
-        // IMPORTANT: All IDs as strings, not BigInt!
-        chatId: chatId,
-        messageId: bigIntToString(message.id),
-        text: message.text || message.message || '',
-        isOutgoing: isOutgoing,
-        date: message.date ? new Date(message.date * 1000).toISOString() : new Date().toISOString(),
-        sender: {
-          firstName: senderInfo.firstName,
-          lastName: senderInfo.lastName,
-          username: senderInfo.username,
-          isBot: senderInfo.isBot
-        },
-        // Bot token for identifying which bot this is from
-        botToken: BOT_TOKEN.split(':')[0] // Only send bot ID, not full token
-      };
-      
-      console.log(`📨 ${isOutgoing ? 'OUTGOING' : 'INCOMING'} message in chat ${chatId}:`, messageData.text?.substring(0, 50));
-      
-      // Sync to Supabase
-      await syncToSupabase({
-        type: 'message',
-        data: messageData
-      });
-      
+      await clientInfo.client.disconnect();
+      telegramClients.delete(botId);
+      console.log(`🔌 [${clientInfo.botName}] Desconectado`);
     } catch (error) {
-      console.error('Error handling message:', error);
+      console.error(`Erro ao desconectar bot ${botId}:`, error);
     }
-  }, new NewMessage({}));
-  
-  console.log('✅ Message handler set up successfully');
+  }
 }
 
-// Health check endpoint
+// Load and connect all bots from Supabase
+async function loadAndConnectBots() {
+  console.log('📋 Carregando bots do Supabase...');
+
+  const { data: bots, error } = await supabase
+    .from('bots_black')
+    .select('id, nome, api_token, ativo')
+    .eq('ativo', true);
+
+  if (error) {
+    console.error('Erro ao buscar bots:', error);
+    return;
+  }
+
+  console.log(`📊 Encontrados ${bots.length} bots ativos`);
+
+  // Connect each bot
+  let connectedCount = 0;
+  for (const bot of bots) {
+    const success = await connectBot(bot);
+    if (success) connectedCount++;
+  }
+
+  console.log(`\n🚀 ${connectedCount}/${bots.length} bots conectados via MTProto`);
+}
+
+// === HTTP Endpoints ===
+
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    connected: isConnected,
+    connectedBots: telegramClients.size,
+    bots: Array.from(telegramClients.entries()).map(([id, info]) => ({
+      id,
+      name: info.botName,
+      username: info.botUsername,
+      connectedAt: info.connectedAt
+    })),
     timestamp: new Date().toISOString()
   });
 });
 
-// Manual reconnect endpoint
-app.post('/reconnect', async (req, res) => {
-  try {
-    if (client) {
-      await client.disconnect();
-    }
-    const success = await initializeTelegramClient();
-    res.json({ success, message: success ? 'Reconnected' : 'Failed to reconnect' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+// Reload all bots
+app.post('/reload', async (req, res) => {
+  console.log('🔄 Recarregando bots...');
+  
+  // Disconnect all
+  for (const [botId] of telegramClients) {
+    await disconnectBot(botId);
+  }
+
+  // Reconnect
+  await loadAndConnectBots();
+
+  res.json({
+    status: 'reloaded',
+    connectedBots: telegramClients.size
+  });
+});
+
+// Connect a specific bot
+app.post('/connect/:botId', async (req, res) => {
+  const { botId } = req.params;
+
+  const { data: bot, error } = await supabase
+    .from('bots_black')
+    .select('id, nome, api_token, ativo')
+    .eq('id', botId)
+    .single();
+
+  if (error || !bot) {
+    return res.status(404).json({ error: 'Bot não encontrado' });
+  }
+
+  const success = await connectBot(bot);
+  res.json({ success, botId, botName: bot.nome });
+});
+
+// Disconnect a specific bot
+app.post('/disconnect/:botId', async (req, res) => {
+  const { botId } = req.params;
+  await disconnectBot(botId);
+  res.json({ success: true, botId });
+});
+
+// Status of a specific bot
+app.get('/status/:botId', (req, res) => {
+  const { botId } = req.params;
+  const clientInfo = telegramClients.get(botId);
+
+  if (clientInfo) {
+    res.json({
+      connected: true,
+      botId,
+      botName: clientInfo.botName,
+      botUsername: clientInfo.botUsername,
+      connectedAt: clientInfo.connectedAt
+    });
+  } else {
+    res.json({
+      connected: false,
+      botId
+    });
   }
 });
 
-// Send message endpoint (optional - for testing)
-app.post('/send', async (req, res) => {
+// Send message via a specific bot
+app.post('/send/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const { chatId, text } = req.body;
+
+  const clientInfo = telegramClients.get(botId);
+  
+  if (!clientInfo) {
+    return res.status(404).json({ error: 'Bot não conectado' });
+  }
+
   try {
-    const { chatId, text } = req.body;
-    
-    if (!isConnected || !client) {
-      return res.status(503).json({ success: false, error: 'Not connected to Telegram' });
-    }
-    
-    // Send message via MTProto
-    const result = await client.sendMessage(chatId, { message: text });
-    
+    const result = await clientInfo.client.sendMessage(chatId, { message: text });
     res.json({
       success: true,
       messageId: bigIntToString(result.id)
     });
   } catch (error) {
-    console.error('Error sending message:', error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error(`Erro ao enviar mensagem [${clientInfo.botName}]:`, error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Start server and connect to Telegram
+// Start server and connect bots
 async function start() {
   try {
+    // Validate config
+    if (!API_ID || !API_HASH) {
+      console.error('❌ TELEGRAM_API_ID e TELEGRAM_API_HASH são obrigatórios!');
+      console.error('   Obtenha em: https://my.telegram.org/apps');
+      process.exit(1);
+    }
+
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+      console.error('❌ SUPABASE_URL e SUPABASE_SERVICE_KEY são obrigatórios!');
+      process.exit(1);
+    }
+
     // Start Express server
     app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
     });
-    
-    // Connect to Telegram
-    await initializeTelegramClient();
-    
-    // Keep process alive
+
+    // Connect bots
+    await loadAndConnectBots();
+
+    // Graceful shutdown
     process.on('SIGINT', async () => {
-      console.log('Shutting down...');
-      if (client) {
-        await client.disconnect();
+      console.log('\n🛑 Encerrando...');
+      for (const [botId] of telegramClients) {
+        await disconnectBot(botId);
       }
       process.exit(0);
     });
-    
+
     process.on('SIGTERM', async () => {
-      console.log('Received SIGTERM, shutting down...');
-      if (client) {
-        await client.disconnect();
+      console.log('\n🛑 Recebido SIGTERM, encerrando...');
+      for (const [botId] of telegramClients) {
+        await disconnectBot(botId);
       }
       process.exit(0);
     });
-    
+
   } catch (error) {
-    console.error('Failed to start:', error);
+    console.error('Falha ao iniciar:', error);
     process.exit(1);
   }
 }
