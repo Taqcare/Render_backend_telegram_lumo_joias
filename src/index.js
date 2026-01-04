@@ -1,4 +1,10 @@
-require('dotenv').config();
+// Only load dotenv if .env file exists (for local development)
+try {
+  require('dotenv').config();
+} catch (e) {
+  // Running in production without .env file
+}
+
 const express = require('express');
 const { TelegramClient } = require('telegram');
 const { NewMessage } = require('telegram/events');
@@ -8,15 +14,35 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
 
-// Configuration
+// Configuration - log what we have for debugging
+console.log('🔧 Verificando variáveis de ambiente...');
+console.log('   SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ definido' : '✗ NÃO definido');
+console.log('   SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ definido' : '✗ NÃO definido');
+console.log('   SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? '✓ definido' : '✗ NÃO definido');
+console.log('   TELEGRAM_API_ID:', process.env.TELEGRAM_API_ID ? '✓ definido' : '✗ NÃO definido');
+console.log('   TELEGRAM_API_HASH:', process.env.TELEGRAM_API_HASH ? '✓ definido' : '✗ NÃO definido');
+console.log('   TELEGRAM_SYNC_SECRET:', process.env.TELEGRAM_SYNC_SECRET ? '✓ definido' : '✗ NÃO definido');
+
 const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const TELEGRAM_SYNC_SECRET = process.env.TELEGRAM_SYNC_SECRET;
 const PORT = process.env.PORT || 3000;
 
-// Supabase client
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Validate before creating Supabase client
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('❌ SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY são obrigatórios!');
+  console.error('   Verifique as variáveis de ambiente no Render.');
+  console.error('   Variáveis recebidas:');
+  console.error('   - SUPABASE_URL:', SUPABASE_URL || '(vazio)');
+  console.error('   - SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? '(valor presente)' : '(vazio)');
+  process.exit(1);
+}
+
+// Supabase client (for sync operations) - uses service role key to bypass RLS
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Map of Telegram clients (one per bot)
 const telegramClients = new Map();
@@ -244,21 +270,28 @@ async function disconnectBot(botId) {
   }
 }
 
-// Load and connect all bots from Supabase
+// Load and connect all bots via Edge Function
 async function loadAndConnectBots() {
-  console.log('📋 Carregando bots do Supabase...');
+  console.log('📋 Carregando bots via Edge Function...');
 
-  const { data: bots, error } = await supabase
-    .from('bots_black')
-    .select('id, nome, api_token, ativo')
-    .eq('ativo', true);
+  try {
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/telegram-bots-list`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'x-sync-secret': TELEGRAM_SYNC_SECRET
+      }
+    });
 
-  if (error) {
-    console.error('Erro ao buscar bots:', error);
-    return;
-  }
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Erro ao buscar bots:', response.status, errorText);
+      return;
+    }
 
-  console.log(`📊 Encontrados ${bots.length} bots ativos`);
+    const { bots } = await response.json();
+    console.log(`📊 Encontrados ${bots.length} bots ativos com token`);
 
   // Connect each bot
   let connectedCount = 0;
@@ -267,7 +300,11 @@ async function loadAndConnectBots() {
     if (success) connectedCount++;
   }
 
-  console.log(`\n🚀 ${connectedCount}/${bots.length} bots conectados via MTProto`);
+    console.log(`\n🚀 ${connectedCount}/${bots.length} bots conectados via MTProto`);
+
+  } catch (error) {
+    console.error('Erro ao carregar bots:', error.message);
+  }
 }
 
 // === HTTP Endpoints ===
@@ -377,15 +414,15 @@ app.post('/send/:botId', async (req, res) => {
 // Start server and connect bots
 async function start() {
   try {
-    // Validate config
+    // Validate Telegram config
     if (!API_ID || !API_HASH) {
       console.error('❌ TELEGRAM_API_ID e TELEGRAM_API_HASH são obrigatórios!');
       console.error('   Obtenha em: https://my.telegram.org/apps');
       process.exit(1);
     }
 
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-      console.error('❌ SUPABASE_URL e SUPABASE_SERVICE_KEY são obrigatórios!');
+    if (!TELEGRAM_SYNC_SECRET) {
+      console.error('❌ TELEGRAM_SYNC_SECRET é obrigatório!');
       process.exit(1);
     }
 
