@@ -18,6 +18,7 @@ app.use(express.json());
 console.log('🔧 Verificando variáveis de ambiente...');
 console.log('   SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ definido' : '✗ NÃO definido');
 console.log('   SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ definido' : '✗ NÃO definido');
+console.log('   SUPABASE_SERVICE_KEY:', process.env.SUPABASE_SERVICE_KEY ? '✓ definido' : '✗ NÃO definido');
 console.log('   SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? '✓ definido' : '✗ NÃO definido');
 console.log('   TELEGRAM_API_ID:', process.env.TELEGRAM_API_ID ? '✓ definido' : '✗ NÃO definido');
 console.log('   TELEGRAM_API_HASH:', process.env.TELEGRAM_API_HASH ? '✓ definido' : '✗ NÃO definido');
@@ -26,23 +27,45 @@ console.log('   TELEGRAM_SYNC_SECRET:', process.env.TELEGRAM_SYNC_SECRET ? '✓ 
 const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const TELEGRAM_SYNC_SECRET = process.env.TELEGRAM_SYNC_SECRET;
 const PORT = process.env.PORT || 3000;
 
-// Validate before creating Supabase client
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('❌ SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY são obrigatórios!');
-  console.error('   Verifique as variáveis de ambiente no Render.');
+function getJwtRole(jwt) {
+  try {
+    const payload = jwt?.split?.('.')?.[1];
+    if (!payload) return null;
+    const json = Buffer.from(payload, 'base64').toString('utf8');
+    return JSON.parse(json)?.role ?? null;
+  } catch {
+    return null;
+  }
+}
+
+console.log('   SUPABASE_KEY_ROLE:', getJwtRole(SUPABASE_SERVICE_ROLE_KEY) || '(não identificado)');
+
+// Validate required env for calling backend functions
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error('❌ SUPABASE_URL e SUPABASE_ANON_KEY são obrigatórios!');
+  console.error('   (A anon key é usada apenas para chamar as funções do backend.)');
   console.error('   Variáveis recebidas:');
   console.error('   - SUPABASE_URL:', SUPABASE_URL || '(vazio)');
-  console.error('   - SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? '(valor presente)' : '(vazio)');
+  console.error('   - SUPABASE_ANON_KEY:', SUPABASE_ANON_KEY ? '(valor presente)' : '(vazio)');
   process.exit(1);
 }
 
-// Supabase client (for sync operations) - uses service role key to bypass RLS
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+// Optional admin client (only needed for /connect/:botId)
+const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+
+if (!supabaseAdmin) {
+  console.warn('⚠️ SUPABASE_SERVICE_ROLE_KEY não definido: /connect/:botId ficará indisponível.');
+}
 
 // Map of Telegram clients (one per bot)
 const telegramClients = new Map();
@@ -89,68 +112,40 @@ function extractSenderInfo(message) {
   };
 }
 
-// Sync to Supabase directly
-async function syncToSupabase(botId, chatData, messageData) {
+// Sync message via backend function (avoids RLS issues on direct table writes)
+async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
   try {
-    // Upsert chat
-    const { error: chatError } = await supabase
-      .from('telegram_chats')
-      .upsert({
-        bot_id: botId,
-        chat_id: chatData.chat_id,
-        username: chatData.username,
-        first_name: chatData.first_name,
-        last_name: chatData.last_name,
-        last_message_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'bot_id,chat_id'
-      });
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/telegram-mtproto-sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: SUPABASE_ANON_KEY,
+        'x-sync-secret': TELEGRAM_SYNC_SECRET,
+      },
+      body: JSON.stringify({
+        type: 'message',
+        data: {
+          ...payload,
+          botToken: botTokenPrefix,
+        },
+      }),
+    });
 
-    if (chatError) {
-      console.error(`[Bot ${botId}] Erro ao salvar chat:`, chatError);
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`❌ [${botName}] Falha ao sincronizar (telegram-mtproto-sync):`, response.status, errorText);
       return false;
     }
 
-    // Get saved chat ID
-    const { data: savedChat } = await supabase
-      .from('telegram_chats')
-      .select('id')
-      .eq('bot_id', botId)
-      .eq('chat_id', chatData.chat_id)
-      .single();
-
-    if (savedChat) {
-      // Insert message
-      const { error: msgError } = await supabase
-        .from('telegram_messages')
-        .upsert({
-          telegram_chat_id: savedChat.id,
-          telegram_message_id: messageData.message_id,
-          text: messageData.text,
-          direction: messageData.direction,
-          sent_at: messageData.sent_at
-        }, {
-          onConflict: 'telegram_chat_id,telegram_message_id'
-        });
-
-      if (msgError) {
-        console.error(`[Bot ${botId}] Erro ao salvar mensagem:`, msgError);
-        return false;
-      }
-
-      return true;
-    }
-
-    return false;
+    return true;
   } catch (error) {
-    console.error(`[Bot ${botId}] Erro na sincronização:`, error);
+    console.error(`❌ [${botName}] Erro ao chamar telegram-mtproto-sync:`, error);
     return false;
   }
 }
 
 // Create message handler for a specific bot
-function createMessageHandler(botId, botName) {
+function createMessageHandler(botId, botName, botTokenPrefix) {
   return async (event) => {
     try {
       const message = event.message;
@@ -168,29 +163,34 @@ function createMessageHandler(botId, botName) {
       const senderInfo = extractSenderInfo(message);
 
       // Log message
-      console.log(`📨 [${botName}] ${direction.toUpperCase()} | Chat: ${chatId} | ${senderInfo.firstName || 'Unknown'}: ${message.text?.substring(0, 50) || '[sem texto]'}`);
+      const previewText = (message.text || message.message || '').substring(0, 50) || '[sem texto]';
+      console.log(
+        `📨 [${botName}] ${direction.toUpperCase()} | Chat: ${chatId} | ${senderInfo.firstName || 'Unknown'}: ${previewText}`
+      );
 
-      // Prepare data
-      const chatData = {
-        chat_id: parseInt(chatId),
-        username: senderInfo.username,
-        first_name: senderInfo.firstName,
-        last_name: senderInfo.lastName
-      };
+      const sentAt = message.date
+        ? new Date(message.date * 1000).toISOString()
+        : new Date().toISOString();
 
-      const messageData = {
-        message_id: parseInt(bigIntToString(message.id)),
+      const payload = {
+        chatId: String(chatId),
+        messageId: String(bigIntToString(message.id)),
         text: message.text || message.message || '',
-        direction: direction,
-        sent_at: message.date ? new Date(message.date * 1000).toISOString() : new Date().toISOString()
+        isOutgoing,
+        date: sentAt,
+        sender: {
+          firstName: senderInfo.firstName,
+          lastName: senderInfo.lastName,
+          username: senderInfo.username,
+          isBot: senderInfo.isBot,
+        },
       };
 
-      // Sync to Supabase
-      const success = await syncToSupabase(botId, chatData, messageData);
+      // Sync via backend function
+      const success = await syncViaBackendFunction(botName, botTokenPrefix, payload);
       if (success) {
         console.log(`✅ [${botName}] Mensagem sincronizada`);
       }
-
     } catch (error) {
       console.error(`[${botName}] Erro ao processar mensagem:`, error);
     }
@@ -234,9 +234,11 @@ async function connectBot(bot) {
     const me = await client.getMe();
     console.log(`✅ [${botName}] Conectado como @${me.username}`);
 
+    const botTokenPrefix = String(botToken).split(':')[0];
+
     // Add message handler
     client.addEventHandler(
-      createMessageHandler(botId, botName),
+      createMessageHandler(botId, botName, botTokenPrefix),
       new NewMessage({})
     );
 
@@ -346,7 +348,13 @@ app.post('/reload', async (req, res) => {
 app.post('/connect/:botId', async (req, res) => {
   const { botId } = req.params;
 
-  const { data: bot, error } = await supabase
+  if (!supabaseAdmin) {
+    return res.status(503).json({
+      error: 'SUPABASE_SERVICE_ROLE_KEY não configurado no servidor',
+    });
+  }
+
+  const { data: bot, error } = await supabaseAdmin
     .from('bots_black')
     .select('id, nome, api_token, ativo')
     .eq('id', botId)
