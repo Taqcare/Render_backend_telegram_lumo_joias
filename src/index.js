@@ -185,6 +185,32 @@ async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
   }
 }
 
+// Helper: Download message media (photo) and return base64 data URL
+async function downloadMessageMedia(client, message, botName) {
+  try {
+    if (!message.media) return null;
+    
+    // Check if it's a photo
+    const mediaType = message.media.className || message.media._;
+    console.log(`📎 [${botName}] Media type: ${mediaType}`);
+    
+    if (mediaType === 'MessageMediaPhoto' || message.media.photo) {
+      const buffer = await client.downloadMedia(message, {});
+      if (buffer) {
+        const base64 = Buffer.from(buffer).toString('base64');
+        console.log(`📷 [${botName}] Foto baixada: ${Math.round(buffer.length / 1024)}KB`);
+        return `data:image/jpeg;base64,${base64}`;
+      }
+    }
+    
+    // For other media types, just log
+    console.log(`📎 [${botName}] Media não suportada: ${mediaType}`);
+  } catch (error) {
+    console.error(`📎 [${botName}] Erro ao baixar mídia:`, error.message);
+  }
+  return null;
+}
+
 // Create message handler for a specific bot
 function createMessageHandler(botId, botName, botTokenPrefix) {
   // Cache to avoid fetching photo too frequently
@@ -206,10 +232,14 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
       // Extract sender info
       const senderInfo = extractSenderInfo(message);
 
+      // Check if message has media
+      const hasMedia = !!message.media;
+      
       // Log message
       const previewText = (message.text || message.message || '').substring(0, 50) || '[sem texto]';
+      const mediaIndicator = hasMedia ? ' 📷' : '';
       console.log(
-        `📨 [${botName}] ${direction.toUpperCase()} | Chat: ${chatId} | ${senderInfo.firstName || 'Unknown'}: ${previewText}`
+        `📨 [${botName}] ${direction.toUpperCase()}${mediaIndicator} | Chat: ${chatId} | ${senderInfo.firstName || 'Unknown'}: ${previewText}`
       );
 
       const sentAt = message.date
@@ -242,6 +272,15 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         }
       }
 
+      // Download message media if present
+      let mediaUrl = null;
+      if (hasMedia) {
+        const clientInfo = telegramClients.get(botId);
+        if (clientInfo) {
+          mediaUrl = await downloadMessageMedia(clientInfo.client, message, botName);
+        }
+      }
+
       const payload = {
         chatId: String(chatId),
         messageId: String(bigIntToString(message.id)),
@@ -255,12 +294,13 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
           isBot: senderInfo.isBot,
         },
         profilePhotoUrl,
+        mediaUrl,
       };
 
       // Sync via backend function
       const success = await syncViaBackendFunction(botName, botTokenPrefix, payload);
       if (success) {
-        console.log(`✅ [${botName}] Mensagem sincronizada`);
+        console.log(`✅ [${botName}] Mensagem sincronizada${mediaUrl ? ' (com mídia)' : ''}`);
       }
     } catch (error) {
       console.error(`[${botName}] Erro ao processar mensagem:`, error);
