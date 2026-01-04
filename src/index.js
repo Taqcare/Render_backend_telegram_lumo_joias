@@ -6,7 +6,7 @@ try {
 }
 
 const express = require('express');
-const { TelegramClient } = require('telegram');
+const { TelegramClient, Api } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
 const { createClient } = require('@supabase/supabase-js');
@@ -114,43 +114,44 @@ function extractSenderInfo(message) {
   };
 }
 
-// Helper: Download user profile photo and return base64 or URL
-async function getProfilePhotoUrl(client, userId, botName) {
+// Helper: Download user profile photo and return base64 data URL
+async function getProfilePhotoUrl(client, userPeer, botName) {
   try {
-    // Get user's profile photos
-    const result = await client.invoke({
-      _: 'photos.getUserPhotos',
-      userId: userId,
-      offset: 0,
-      maxId: 0,
-      limit: 1
-    });
+    const entity = (typeof userPeer === 'object' && userPeer !== null)
+      ? userPeer
+      : await client.getEntity(userPeer);
 
-    if (result && result.photos && result.photos.length > 0) {
-      const photo = result.photos[0];
-      // Download the smallest size for profile
-      const sizes = photo.sizes || [];
-      const smallSize = sizes.find(s => s.type === 's' || s.type === 'm') || sizes[0];
-      
-      if (smallSize) {
-        const buffer = await client.downloadMedia(photo, {
-          thumb: smallSize
-        });
-        
-        if (buffer) {
-          // Convert to base64 data URL
-          const base64 = buffer.toString('base64');
-          const mimeType = 'image/jpeg';
-          return `data:${mimeType};base64,${base64}`;
-        }
-      }
-    }
+    const result = await client.invoke(
+      new Api.photos.GetUserPhotos({
+        userId: entity,
+        offset: 0,
+        maxId: 0,
+        limit: 1,
+      })
+    );
+
+    const photos = result?.photos ?? [];
+    if (!Array.isArray(photos) || photos.length === 0) return null;
+
+    const photo = photos[0];
+    const sizes = photo?.sizes || [];
+    const smallSize =
+      sizes.find((s) => s.type === 'a' || s.type === 's' || s.type === 'm') || sizes[0];
+
+    if (!smallSize) return null;
+
+    const buffer = await client.downloadMedia(photo, { thumb: smallSize });
+    if (!buffer) return null;
+
+    const base64 = Buffer.from(buffer).toString('base64');
+    return `data:image/jpeg;base64,${base64}`;
   } catch (error) {
     // Silently fail - not all users have profile photos or we may not have permission
     console.log(`📷 [${botName}] Não foi possível obter foto de perfil: ${error.message}`);
+    return null;
   }
-  return null;
 }
+
 
 // Sync message via backend function (avoids RLS issues on direct table writes)
 async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
@@ -220,16 +221,23 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
       if (!isOutgoing && !senderInfo.isBot) {
         const cacheKey = chatId;
         const cachedPhoto = photoCache.get(cacheKey);
-        
-        // Use cache if photo was fetched in the last hour
-        if (cachedPhoto && (Date.now() - cachedPhoto.timestamp) < 3600000) {
+
+        // Use cache if we have a non-null photo fetched in the last hour
+        if (cachedPhoto?.url && (Date.now() - cachedPhoto.timestamp) < 3600000) {
           profilePhotoUrl = cachedPhoto.url;
         } else {
           // Fetch new photo
           const clientInfo = telegramClients.get(botId);
           if (clientInfo) {
-            profilePhotoUrl = await getProfilePhotoUrl(clientInfo.client, chatId, botName);
-            photoCache.set(cacheKey, { url: profilePhotoUrl, timestamp: Date.now() });
+            const userPeer = message._sender || message.sender || message.senderId || chatId;
+            profilePhotoUrl = await getProfilePhotoUrl(clientInfo.client, userPeer, botName);
+
+            // Only cache when we actually got an URL (avoid caching null for 1h)
+            if (profilePhotoUrl) {
+              photoCache.set(cacheKey, { url: profilePhotoUrl, timestamp: Date.now() });
+            } else {
+              photoCache.delete(cacheKey);
+            }
           }
         }
       }
