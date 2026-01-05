@@ -448,9 +448,39 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Reload all bots
+// Reload all bots (called by Lovable when a new token is added)
+app.post('/reload-bots', async (req, res) => {
+  const syncSecret = req.headers['x-sync-secret'];
+  
+  if (syncSecret !== TELEGRAM_SYNC_SECRET) {
+    console.log('⚠️ Tentativa de reload sem autenticação válida');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { action, botId } = req.body || {};
+  console.log(`🔄 Reload request - Action: ${action || 'full_reload'}, Bot ID: ${botId || 'all'}`);
+  
+  // Disconnect all existing bots
+  console.log('🔌 Desconectando bots existentes...');
+  for (const [id] of telegramClients) {
+    await disconnectBot(id);
+  }
+
+  // Reconnect all bots (fetches fresh list from database)
+  await loadAndConnectBots();
+
+  res.json({
+    success: true,
+    message: 'Bots reloaded successfully',
+    connectedBots: telegramClients.size,
+    action,
+    botId
+  });
+});
+
+// Legacy reload endpoint (keep for backwards compatibility)
 app.post('/reload', async (req, res) => {
-  console.log('🔄 Recarregando bots...');
+  console.log('🔄 Recarregando bots (legacy endpoint)...');
   
   // Disconnect all
   for (const [botId] of telegramClients) {
