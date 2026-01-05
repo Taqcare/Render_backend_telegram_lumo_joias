@@ -185,31 +185,42 @@ async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
   }
 }
 
-// Helper: Download message media (photo) and return base64 data URL
+// Helper: Download message media (photo/doc) and return base64 data URL
 async function downloadMessageMedia(client, message, botName) {
   try {
-    if (!message.media) return null;
-    
-    // Check if it's a photo
-    const mediaType = message.media.className || message.media._;
-    console.log(`📎 [${botName}] Media type: ${mediaType}`);
-    
-    if (mediaType === 'MessageMediaPhoto' || message.media.photo) {
-      const buffer = await client.downloadMedia(message, {});
-      if (buffer) {
-        const base64 = Buffer.from(buffer).toString('base64');
-        console.log(`📷 [${botName}] Foto baixada: ${Math.round(buffer.length / 1024)}KB`);
-        return `data:image/jpeg;base64,${base64}`;
-      }
+    const photo = message.photo || message.media?.photo;
+    const document = message.document || message.media?.document;
+    const hasAnyMedia = !!(photo || document || message.media);
+
+    if (!hasAnyMedia) return null;
+
+    let buffer = null;
+    let mimeType = 'image/jpeg';
+
+    // Prefer explicit photo/document objects when available
+    if (photo) {
+      buffer = await client.downloadMedia(photo);
+      mimeType = 'image/jpeg';
+    } else if (document) {
+      buffer = await client.downloadMedia(document);
+      mimeType = document.mimeType || document.mime_type || 'application/octet-stream';
+    } else {
+      // Fallback: let GramJS infer from the message wrapper
+      buffer = await client.downloadMedia(message);
+      mimeType = 'image/jpeg';
     }
-    
-    // For other media types, just log
-    console.log(`📎 [${botName}] Media não suportada: ${mediaType}`);
+
+    if (!buffer) return null;
+
+    const base64 = Buffer.from(buffer).toString('base64');
+    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(buffer.length / 1024)}KB (${mimeType})`);
+    return `data:${mimeType};base64,${base64}`;
   } catch (error) {
-    console.error(`📎 [${botName}] Erro ao baixar mídia:`, error.message);
+    console.error(`📎 [${botName}] Erro ao baixar mídia:`, error?.message || error);
+    return null;
   }
-  return null;
 }
+
 
 // Create message handler for a specific bot
 function createMessageHandler(botId, botName, botTokenPrefix) {
@@ -233,7 +244,7 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
       const senderInfo = extractSenderInfo(message);
 
       // Check if message has media
-      const hasMedia = !!message.media;
+      const hasMedia = !!(message.media || message.photo || message.document);
       
       // Log message
       const previewText = (message.text || message.message || '').substring(0, 50) || '[sem texto]';
