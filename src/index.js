@@ -155,8 +155,10 @@ async function getProfilePhotoUrl(client, userPeer, botName) {
 
 // Sync message via backend function (avoids RLS issues on direct table writes)
 async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
+  const url = `${SUPABASE_URL}/functions/v1/telegram-mtproto-sync`;
+
   try {
-    const response = await fetch(`${SUPABASE_URL}/functions/v1/telegram-mtproto-sync`, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -172,15 +174,25 @@ async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
       }),
     });
 
+    // Verbose diagnostics (safe to log URL + status; never log keys)
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`❌ [${botName}] Falha ao sincronizar (telegram-mtproto-sync):`, response.status, errorText);
+      console.error(`   URL: ${url}`);
       return false;
+    }
+
+    const okText = await response.text().catch(() => '');
+    if (okText) {
+      console.log(`✅ [${botName}] Sync OK (${response.status}) -> ${url} | resp: ${okText.slice(0, 200)}`);
+    } else {
+      console.log(`✅ [${botName}] Sync OK (${response.status}) -> ${url}`);
     }
 
     return true;
   } catch (error) {
     console.error(`❌ [${botName}] Erro ao chamar telegram-mtproto-sync:`, error);
+    console.error(`   URL: ${url}`);
     return false;
   }
 }
