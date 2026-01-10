@@ -10,6 +10,7 @@ const { TelegramClient, Api } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
 const { createClient } = require('@supabase/supabase-js');
+const util = require('util');
 
 const app = express();
 app.use(express.json());
@@ -304,6 +305,62 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         }
       }
 
+      // Extract inline keyboard buttons if present
+      let replyMarkup = null;
+
+      // GramJS sometimes exposes reply markup in different places depending on wrappers.
+      // Try a few candidates.
+      const rmCandidate =
+        message.replyMarkup ??
+        message.reply_markup ??
+        message.message?.replyMarkup ??
+        message.message?.reply_markup ??
+        null;
+
+      const isCandidateForButtons = isOutgoing && !hasMedia;
+
+      // Lightweight diagnostics when we expect buttons but none are found
+      if (isCandidateForButtons && !rmCandidate) {
+        const ctor = message?.constructor?.name || 'unknown';
+        const hasProp = (() => {
+          try { return 'replyMarkup' in message; } catch { return false; }
+        })();
+        console.log(
+          `🧩 [${botName}] replyMarkup ausente (ctor=${ctor}, hasProp=${hasProp}) | text="${previewText}"`
+        );
+      }
+
+      // Debug: Log raw replyMarkup structure when present (util.inspect handles GramJS classes better)
+      if (rmCandidate) {
+        console.log(
+          `🔘 [${botName}] Raw replyMarkup (inspect):\n` +
+            util.inspect(rmCandidate, { depth: 8, colors: false, getters: true })
+        );
+      }
+
+      // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
+      if (rmCandidate?.rows && Array.isArray(rmCandidate.rows)) {
+        replyMarkup = {
+          rows: rmCandidate.rows.map((row) => ({
+            buttons: (row?.buttons || []).map((button) => ({
+              text: button?.text || '',
+              url: button?.url || null,
+              callbackData: button?.data
+                ? typeof button.data === 'string'
+                  ? button.data
+                  : Buffer.isBuffer(button.data)
+                    ? button.data.toString('utf-8')
+                    : String(button.data)
+                : null,
+            })),
+          })),
+        };
+
+        console.log(
+          `🔘 [${botName}] Mensagem com ${replyMarkup.rows.reduce((acc, r) => acc + r.buttons.length, 0)} botões inline`
+        );
+      }
+
       const payload = {
         chatId: String(chatId),
         messageId: String(bigIntToString(message.id)),
@@ -318,6 +375,7 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         },
         profilePhotoUrl,
         mediaUrl,
+        replyMarkup,
       };
 
       // Sync via backend function
@@ -579,6 +637,102 @@ app.post('/send/:botId', async (req, res) => {
     });
   } catch (error) {
     console.error(`Erro ao enviar mensagem [${clientInfo.botName}]:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Edit message via a specific bot
+app.post('/edit/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const { chatId, messageId, text } = req.body;
+
+  const clientInfo = telegramClients.get(botId);
+  
+  if (!clientInfo) {
+    return res.status(404).json({ error: 'Bot não conectado' });
+  }
+
+  try {
+    await clientInfo.client.invoke(
+      new Api.messages.EditMessage({
+        peer: chatId,
+        id: parseInt(messageId),
+        message: text,
+      })
+    );
+    
+    console.log(`✏️ [${clientInfo.botName}] Mensagem ${messageId} editada no chat ${chatId}`);
+    res.json({
+      success: true,
+      messageId,
+      chatId
+    });
+  } catch (error) {
+    console.error(`Erro ao editar mensagem [${clientInfo.botName}]:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete message via a specific bot
+app.post('/delete/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const { chatId, messageId } = req.body;
+
+  const clientInfo = telegramClients.get(botId);
+  
+  if (!clientInfo) {
+    return res.status(404).json({ error: 'Bot não conectado' });
+  }
+
+  try {
+    await clientInfo.client.invoke(
+      new Api.messages.DeleteMessages({
+        id: [parseInt(messageId)],
+        revoke: true, // Delete for both sides
+      })
+    );
+    
+    console.log(`🗑️ [${clientInfo.botName}] Mensagem ${messageId} deletada do chat ${chatId}`);
+    res.json({
+      success: true,
+      messageId,
+      chatId
+    });
+  } catch (error) {
+    console.error(`Erro ao deletar mensagem [${clientInfo.botName}]:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete multiple messages via a specific bot
+app.post('/delete-messages/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const { chatId, messageIds } = req.body;
+
+  const clientInfo = telegramClients.get(botId);
+  
+  if (!clientInfo) {
+    return res.status(404).json({ error: 'Bot não conectado' });
+  }
+
+  try {
+    const ids = messageIds.map(id => parseInt(id));
+    
+    await clientInfo.client.invoke(
+      new Api.messages.DeleteMessages({
+        id: ids,
+        revoke: true, // Delete for both sides
+      })
+    );
+    
+    console.log(`🗑️ [${clientInfo.botName}] ${ids.length} mensagens deletadas do chat ${chatId}`);
+    res.json({
+      success: true,
+      deletedCount: ids.length,
+      chatId
+    });
+  } catch (error) {
+    console.error(`Erro ao deletar mensagens [${clientInfo.botName}]:`, error);
     res.status(500).json({ error: error.message });
   }
 });
