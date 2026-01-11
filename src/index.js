@@ -198,6 +198,7 @@ async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
 }
 
 // Helper: Upload media to storage via edge function (with deduplication)
+// Returns { fileUniqueId, publicUrl } or null
 async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName) {
   const url = `${SUPABASE_URL}/functions/v1/upload-telegram-media`;
   
@@ -233,7 +234,11 @@ async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, 
       } else {
         console.log(`☁️ [${botName}] Mídia enviada para storage: ${result.storagePath}`);
       }
-      return result.publicUrl;
+      // Return both fileUniqueId and publicUrl for reference
+      return { 
+        fileUniqueId: fileUniqueId, 
+        publicUrl: result.publicUrl 
+      };
     }
     
     return null;
@@ -244,6 +249,7 @@ async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, 
 }
 
 // Helper: Download message media (photo/doc) and upload to storage (with deduplication)
+// Returns { fileUniqueId, publicUrl } or null
 async function downloadMessageMedia(client, message, botName, botId) {
   try {
     const photo = message.photo || message.media?.photo;
@@ -262,12 +268,14 @@ async function downloadMessageMedia(client, message, botName, botId) {
     if (photo) {
       buffer = await client.downloadMedia(photo);
       mimeType = 'image/jpeg';
+      // Use photo.id as fileUniqueId (consistent across bot API and MTProto)
       fileUniqueId = photo.id ? bigIntToString(photo.id) : null;
       fileId = photo.accessHash ? bigIntToString(photo.accessHash) : null;
       mediaType = 'photo';
     } else if (document) {
       buffer = await client.downloadMedia(document);
       mimeType = document.mimeType || document.mime_type || 'application/octet-stream';
+      // Use document.id as fileUniqueId
       fileUniqueId = document.id ? bigIntToString(document.id) : null;
       fileId = document.accessHash ? bigIntToString(document.accessHash) : null;
       
@@ -288,22 +296,27 @@ async function downloadMessageMedia(client, message, botName, botId) {
 
     if (!buffer) return null;
 
+    // Generate a fallback fileUniqueId if none was extracted
+    if (!fileUniqueId) {
+      const hash = require('crypto').createHash('md5').update(buffer).digest('hex').substring(0, 16);
+      fileUniqueId = `gen_${hash}`;
+      console.log(`📎 [${botName}] Gerado fileUniqueId de fallback: ${fileUniqueId}`);
+    }
+
     const base64 = Buffer.from(buffer).toString('base64');
     const base64Data = `data:${mimeType};base64,${base64}`;
     
-    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(buffer.length / 1024)}KB (${mimeType})${fileUniqueId ? ` [ID: ${fileUniqueId}]` : ''}`);
+    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(buffer.length / 1024)}KB (${mimeType}) [ID: ${fileUniqueId}]`);
     
-    // Upload to storage with deduplication
-    const storageUrl = await uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName);
+    // Upload to storage with deduplication - returns { fileUniqueId, publicUrl }
+    const result = await uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName);
     
-    // Return storage URL only - never store base64 in database
-    // If upload fails, return null to avoid storing large base64 data
-    if (!storageUrl) {
-      console.warn(`⚠️ [${botName}] Upload falhou, mídia não será salva para evitar base64 no banco`);
+    if (!result) {
+      console.warn(`⚠️ [${botName}] Upload falhou, mídia não será salva`);
       return null;
     }
     
-    return storageUrl;
+    return result;
   } catch (error) {
     console.error(`📎 [${botName}] Erro ao baixar mídia:`, error?.message || error);
     return null;
@@ -372,20 +385,18 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         }
       }
 
-      // Download message media if present
-      let mediaUrl = null;
+      // Download message media if present - returns { fileUniqueId, publicUrl } or null
+      let mediaResult = null;
       if (hasMedia) {
         const clientInfo = telegramClients.get(botId);
         if (clientInfo) {
-          mediaUrl = await downloadMessageMedia(clientInfo.client, message, botName, botId);
+          mediaResult = await downloadMessageMedia(clientInfo.client, message, botName, botId);
         }
       }
 
       // Extract inline keyboard buttons if present
       let replyMarkup = null;
       const rmCandidate = message.replyMarkup ?? null;
-
-      // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
 
       // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
       if (rmCandidate?.rows && Array.isArray(rmCandidate.rows)) {
@@ -410,6 +421,7 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         );
       }
 
+      // Build payload with fileUniqueId instead of mediaUrl
       const payload = {
         chatId: String(chatId),
         messageId: String(bigIntToString(message.id)),
@@ -423,14 +435,14 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
           isBot: senderInfo.isBot,
         },
         profilePhotoUrl,
-        mediaUrl,
+        fileUniqueId: mediaResult?.fileUniqueId || null, // Send fileUniqueId instead of mediaUrl
         replyMarkup,
       };
 
       // Sync via backend function
       const success = await syncViaBackendFunction(botName, botTokenPrefix, payload);
       if (success) {
-        console.log(`✅ [${botName}] Mensagem sincronizada${mediaUrl ? ' (com mídia)' : ''}`);
+        console.log(`✅ [${botName}] Mensagem sincronizada${mediaResult ? ' (com mídia: ' + mediaResult.fileUniqueId + ')' : ''}`);
       }
     } catch (error) {
       console.error(`[${botName}] Erro ao processar mensagem:`, error);
