@@ -10,7 +10,6 @@ const { TelegramClient, Api } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
 const { createClient } = require('@supabase/supabase-js');
-const util = require('util');
 
 const app = express();
 app.use(express.json());
@@ -307,36 +306,9 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
 
       // Extract inline keyboard buttons if present
       let replyMarkup = null;
+      const rmCandidate = message.replyMarkup ?? null;
 
-      // GramJS sometimes exposes reply markup in different places depending on wrappers.
-      // Try a few candidates.
-      const rmCandidate =
-        message.replyMarkup ??
-        message.reply_markup ??
-        message.message?.replyMarkup ??
-        message.message?.reply_markup ??
-        null;
-
-      const isCandidateForButtons = isOutgoing && !hasMedia;
-
-      // Lightweight diagnostics when we expect buttons but none are found
-      if (isCandidateForButtons && !rmCandidate) {
-        const ctor = message?.constructor?.name || 'unknown';
-        const hasProp = (() => {
-          try { return 'replyMarkup' in message; } catch { return false; }
-        })();
-        console.log(
-          `🧩 [${botName}] replyMarkup ausente (ctor=${ctor}, hasProp=${hasProp}) | text="${previewText}"`
-        );
-      }
-
-      // Debug: Log raw replyMarkup structure when present (util.inspect handles GramJS classes better)
-      if (rmCandidate) {
-        console.log(
-          `🔘 [${botName}] Raw replyMarkup (inspect):\n` +
-            util.inspect(rmCandidate, { depth: 8, colors: false, getters: true })
-        );
-      }
+      // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
 
       // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
       if (rmCandidate?.rows && Array.isArray(rmCandidate.rows)) {
