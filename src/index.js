@@ -248,68 +248,185 @@ async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, 
   }
 }
 
-// Helper: Download message media (photo/doc) and upload to storage (with deduplication)
+// Helper: Determine media type and info from message
+function getMediaInfo(message) {
+  const media = message.media;
+  const photo = message.photo || media?.photo;
+  const document = message.document || media?.document;
+  
+  // Check for sticker first (it's a special type of document)
+  if (media?.className === 'MessageMediaDocument' || document) {
+    const doc = document || media?.document;
+    if (doc) {
+      const attrs = doc.attributes || [];
+      
+      // Check if it's a sticker
+      const stickerAttr = attrs.find(a => 
+        a.className === 'DocumentAttributeSticker' || 
+        a.stickerset !== undefined
+      );
+      
+      if (stickerAttr) {
+        const isAnimated = (doc.mimeType === 'application/x-tgsticker');
+        const isVideo = (doc.mimeType === 'video/webm');
+        
+        return {
+          type: 'sticker',
+          subType: isAnimated ? 'animated' : (isVideo ? 'video' : 'static'),
+          mimeType: doc.mimeType || 'image/webp',
+          id: doc.id,
+          accessHash: doc.accessHash,
+          emoji: stickerAttr.alt || null,
+          mediaObject: doc
+        };
+      }
+      
+      // Check for GIF/animation
+      const animatedAttr = attrs.find(a => a.className === 'DocumentAttributeAnimated');
+      if (animatedAttr || doc.mimeType === 'video/mp4' && attrs.some(a => a.className === 'DocumentAttributeVideo' && a.nosound)) {
+        return {
+          type: 'animation',
+          subType: 'gif',
+          mimeType: doc.mimeType || 'video/mp4',
+          id: doc.id,
+          accessHash: doc.accessHash,
+          mediaObject: doc
+        };
+      }
+      
+      // Regular document/video/audio
+      const mimeType = doc.mimeType || 'application/octet-stream';
+      let type = 'document';
+      if (mimeType.startsWith('video/')) type = 'video';
+      else if (mimeType.startsWith('audio/')) type = 'audio';
+      else if (mimeType.startsWith('image/')) type = 'photo';
+      
+      return {
+        type,
+        subType: null,
+        mimeType,
+        id: doc.id,
+        accessHash: doc.accessHash,
+        mediaObject: doc
+      };
+    }
+  }
+  
+  // Regular photo
+  if (photo) {
+    return {
+      type: 'photo',
+      subType: null,
+      mimeType: 'image/jpeg',
+      id: photo.id,
+      accessHash: photo.accessHash,
+      mediaObject: photo
+    };
+  }
+  
+  // Fallback for other media types
+  if (media) {
+    return {
+      type: 'unknown',
+      subType: media.className || null,
+      mimeType: 'application/octet-stream',
+      id: null,
+      accessHash: null,
+      mediaObject: message
+    };
+  }
+  
+  return null;
+}
+
+// Helper: Download message media (photo/doc/sticker/animation) and upload to storage (with deduplication)
 // Returns { fileUniqueId, publicUrl } or null
 async function downloadMessageMedia(client, message, botName, botId) {
   try {
-    const photo = message.photo || message.media?.photo;
-    const document = message.document || message.media?.document;
-    const hasAnyMedia = !!(photo || document || message.media);
-
-    if (!hasAnyMedia) return null;
-
+    const mediaInfo = getMediaInfo(message);
+    
+    if (!mediaInfo) return null;
+    
+    // Log what we're processing
+    const mediaDesc = mediaInfo.subType 
+      ? `${mediaInfo.type}/${mediaInfo.subType}` 
+      : mediaInfo.type;
+    console.log(`📎 [${botName}] Processando mídia: ${mediaDesc} (${mediaInfo.mimeType})`);
+    
+    // Handle animated stickers (TGS) - skip for now as they're complex Lottie files
+    if (mediaInfo.type === 'sticker' && mediaInfo.subType === 'animated') {
+      console.log(`⏭️ [${botName}] Sticker animado (TGS) ignorado - formato Lottie não suportado`);
+      return null;
+    }
+    
+    // Download media
     let buffer = null;
-    let mimeType = 'image/jpeg';
-    let fileUniqueId = null;
-    let fileId = null;
-    let mediaType = 'photo';
-
-    // Prefer explicit photo/document objects when available
-    if (photo) {
-      buffer = await client.downloadMedia(photo);
-      mimeType = 'image/jpeg';
-      // Use photo.id as fileUniqueId (consistent across bot API and MTProto)
-      fileUniqueId = photo.id ? bigIntToString(photo.id) : null;
-      fileId = photo.accessHash ? bigIntToString(photo.accessHash) : null;
-      mediaType = 'photo';
-    } else if (document) {
-      buffer = await client.downloadMedia(document);
-      mimeType = document.mimeType || document.mime_type || 'application/octet-stream';
-      // Use document.id as fileUniqueId
-      fileUniqueId = document.id ? bigIntToString(document.id) : null;
-      fileId = document.accessHash ? bigIntToString(document.accessHash) : null;
-      
-      // Determine media type from mime
-      if (mimeType.startsWith('video/')) {
-        mediaType = 'video';
-      } else if (mimeType.startsWith('audio/')) {
-        mediaType = 'audio';
-      } else {
-        mediaType = 'document';
-      }
-    } else {
-      // Fallback: let GramJS infer from the message wrapper
-      buffer = await client.downloadMedia(message);
-      mimeType = 'image/jpeg';
-      mediaType = 'photo';
+    try {
+      buffer = await client.downloadMedia(mediaInfo.mediaObject);
+    } catch (downloadError) {
+      console.error(`📎 [${botName}] Erro no download:`, downloadError?.message);
+      return null;
     }
 
-    if (!buffer) return null;
-
-    // Generate a fallback fileUniqueId if none was extracted
+    if (!buffer || buffer.length === 0) {
+      console.warn(`📎 [${botName}] Buffer vazio após download`);
+      return null;
+    }
+    
+    // Validate buffer is actually binary data
+    if (typeof buffer === 'string') {
+      console.warn(`📎 [${botName}] Buffer retornado como string, convertendo...`);
+      buffer = Buffer.from(buffer, 'binary');
+    }
+    
+    // Generate fileUniqueId
+    let fileUniqueId = mediaInfo.id ? bigIntToString(mediaInfo.id) : null;
+    let fileId = mediaInfo.accessHash ? bigIntToString(mediaInfo.accessHash) : null;
+    
+    // Fallback fileUniqueId if needed
     if (!fileUniqueId) {
-      const hash = require('crypto').createHash('md5').update(buffer).digest('hex').substring(0, 16);
+      const crypto = require('crypto');
+      const hash = crypto.createHash('md5').update(buffer).digest('hex').substring(0, 16);
       fileUniqueId = `gen_${hash}`;
       console.log(`📎 [${botName}] Gerado fileUniqueId de fallback: ${fileUniqueId}`);
     }
 
-    const base64 = Buffer.from(buffer).toString('base64');
-    const base64Data = `data:${mimeType};base64,${base64}`;
+    // Determine the correct extension based on media type
+    let mimeType = mediaInfo.mimeType;
+    let storageMediaType = mediaInfo.type;
     
-    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(buffer.length / 1024)}KB (${mimeType}) [ID: ${fileUniqueId}]`);
+    // Normalize sticker types for storage
+    if (mediaInfo.type === 'sticker') {
+      if (mediaInfo.subType === 'video') {
+        mimeType = 'video/webm';
+        storageMediaType = 'sticker';
+      } else {
+        mimeType = 'image/webp';
+        storageMediaType = 'sticker';
+      }
+    } else if (mediaInfo.type === 'animation') {
+      mimeType = 'video/mp4';
+      storageMediaType = 'animation';
+    }
+
+    // Ensure buffer is a proper Buffer before base64 encoding
+    const properBuffer = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+    const base64 = properBuffer.toString('base64');
+    
+    // Validate base64 output
+    if (!base64 || base64.length === 0) {
+      console.error(`📎 [${botName}] Falha ao converter buffer para base64`);
+      return null;
+    }
+    
+    // Don't include data URI prefix - send raw base64
+    // The edge function will handle adding the prefix if needed
+    const base64Data = base64;
+    
+    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(properBuffer.length / 1024)}KB (${mimeType}) [ID: ${fileUniqueId}]`);
     
     // Upload to storage with deduplication - returns { fileUniqueId, publicUrl }
-    const result = await uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName);
+    const result = await uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, storageMediaType, botName);
     
     if (!result) {
       console.warn(`⚠️ [${botName}] Upload falhou, mídia não será salva`);
