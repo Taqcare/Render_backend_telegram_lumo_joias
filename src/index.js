@@ -10,7 +10,6 @@ const { TelegramClient, Api } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
 const { createClient } = require('@supabase/supabase-js');
-const util = require('util');
 
 const app = express();
 app.use(express.json());
@@ -115,7 +114,7 @@ function extractSenderInfo(message) {
   };
 }
 
-// Helper: Download user profile photo and return base64 data URL
+// Helper: Download user profile photo (returns base64 - kept in database for simplicity)
 async function getProfilePhotoUrl(client, userPeer, botName) {
   try {
     const entity = (typeof userPeer === 'object' && userPeer !== null)
@@ -135,6 +134,7 @@ async function getProfilePhotoUrl(client, userPeer, botName) {
     if (!Array.isArray(photos) || photos.length === 0) return null;
 
     const photo = photos[0];
+    
     const sizes = photo?.sizes || [];
     const smallSize =
       sizes.find((s) => s.type === 'a' || s.type === 's' || s.type === 'm') || sizes[0];
@@ -147,7 +147,6 @@ async function getProfilePhotoUrl(client, userPeer, botName) {
     const base64 = Buffer.from(buffer).toString('base64');
     return `data:image/jpeg;base64,${base64}`;
   } catch (error) {
-    // Silently fail - not all users have profile photos or we may not have permission
     console.log(`📷 [${botName}] Não foi possível obter foto de perfil: ${error.message}`);
     return null;
   }
@@ -198,8 +197,54 @@ async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
   }
 }
 
-// Helper: Download message media (photo/doc) and return base64 data URL
-async function downloadMessageMedia(client, message, botName) {
+// Helper: Upload media to storage via edge function (with deduplication)
+async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName) {
+  const url = `${SUPABASE_URL}/functions/v1/upload-telegram-media`;
+  
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'x-sync-secret': TELEGRAM_SYNC_SECRET,
+      },
+      body: JSON.stringify({
+        base64Data,
+        mimeType,
+        fileUniqueId,
+        fileId,
+        botId,
+        mediaType,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`❌ [${botName}] Falha ao fazer upload de mídia:`, response.status, errorText);
+      return null;
+    }
+
+    const result = await response.json();
+    
+    if (result.success) {
+      if (result.cached) {
+        console.log(`📦 [${botName}] Mídia encontrada no cache: ${fileUniqueId}`);
+      } else {
+        console.log(`☁️ [${botName}] Mídia enviada para storage: ${result.storagePath}`);
+      }
+      return result.publicUrl;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`❌ [${botName}] Erro ao fazer upload de mídia:`, error);
+    return null;
+  }
+}
+
+// Helper: Download message media (photo/doc) and upload to storage (with deduplication)
+async function downloadMessageMedia(client, message, botName, botId) {
   try {
     const photo = message.photo || message.media?.photo;
     const document = message.document || message.media?.document;
@@ -209,25 +254,56 @@ async function downloadMessageMedia(client, message, botName) {
 
     let buffer = null;
     let mimeType = 'image/jpeg';
+    let fileUniqueId = null;
+    let fileId = null;
+    let mediaType = 'photo';
 
     // Prefer explicit photo/document objects when available
     if (photo) {
       buffer = await client.downloadMedia(photo);
       mimeType = 'image/jpeg';
+      fileUniqueId = photo.id ? bigIntToString(photo.id) : null;
+      fileId = photo.accessHash ? bigIntToString(photo.accessHash) : null;
+      mediaType = 'photo';
     } else if (document) {
       buffer = await client.downloadMedia(document);
       mimeType = document.mimeType || document.mime_type || 'application/octet-stream';
+      fileUniqueId = document.id ? bigIntToString(document.id) : null;
+      fileId = document.accessHash ? bigIntToString(document.accessHash) : null;
+      
+      // Determine media type from mime
+      if (mimeType.startsWith('video/')) {
+        mediaType = 'video';
+      } else if (mimeType.startsWith('audio/')) {
+        mediaType = 'audio';
+      } else {
+        mediaType = 'document';
+      }
     } else {
       // Fallback: let GramJS infer from the message wrapper
       buffer = await client.downloadMedia(message);
       mimeType = 'image/jpeg';
+      mediaType = 'photo';
     }
 
     if (!buffer) return null;
 
     const base64 = Buffer.from(buffer).toString('base64');
-    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(buffer.length / 1024)}KB (${mimeType})`);
-    return `data:${mimeType};base64,${base64}`;
+    const base64Data = `data:${mimeType};base64,${base64}`;
+    
+    console.log(`📎 [${botName}] Mídia baixada: ${Math.round(buffer.length / 1024)}KB (${mimeType})${fileUniqueId ? ` [ID: ${fileUniqueId}]` : ''}`);
+    
+    // Upload to storage with deduplication
+    const storageUrl = await uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName);
+    
+    // Return storage URL only - never store base64 in database
+    // If upload fails, return null to avoid storing large base64 data
+    if (!storageUrl) {
+      console.warn(`⚠️ [${botName}] Upload falhou, mídia não será salva para evitar base64 no banco`);
+      return null;
+    }
+    
+    return storageUrl;
   } catch (error) {
     console.error(`📎 [${botName}] Erro ao baixar mídia:`, error?.message || error);
     return null;
@@ -301,42 +377,15 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
       if (hasMedia) {
         const clientInfo = telegramClients.get(botId);
         if (clientInfo) {
-          mediaUrl = await downloadMessageMedia(clientInfo.client, message, botName);
+          mediaUrl = await downloadMessageMedia(clientInfo.client, message, botName, botId);
         }
       }
 
       // Extract inline keyboard buttons if present
       let replyMarkup = null;
+      const rmCandidate = message.replyMarkup ?? null;
 
-      // GramJS sometimes exposes reply markup in different places depending on wrappers.
-      // Try a few candidates.
-      const rmCandidate =
-        message.replyMarkup ??
-        message.reply_markup ??
-        message.message?.replyMarkup ??
-        message.message?.reply_markup ??
-        null;
-
-      const isCandidateForButtons = isOutgoing && !hasMedia;
-
-      // Lightweight diagnostics when we expect buttons but none are found
-      if (isCandidateForButtons && !rmCandidate) {
-        const ctor = message?.constructor?.name || 'unknown';
-        const hasProp = (() => {
-          try { return 'replyMarkup' in message; } catch { return false; }
-        })();
-        console.log(
-          `🧩 [${botName}] replyMarkup ausente (ctor=${ctor}, hasProp=${hasProp}) | text="${previewText}"`
-        );
-      }
-
-      // Debug: Log raw replyMarkup structure when present (util.inspect handles GramJS classes better)
-      if (rmCandidate) {
-        console.log(
-          `🔘 [${botName}] Raw replyMarkup (inspect):\n` +
-            util.inspect(rmCandidate, { depth: 8, colors: false, getters: true })
-        );
-      }
+      // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
 
       // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
       if (rmCandidate?.rows && Array.isArray(rmCandidate.rows)) {
