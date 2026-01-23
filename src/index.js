@@ -915,6 +915,113 @@ app.post('/delete-messages/:botId', async (req, res) => {
   }
 });
 
+// Get user online status via MTProto
+app.get('/user-status/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const { chatId } = req.query;
+  
+  // Validate sync secret for security
+  const syncSecret = req.headers['x-sync-secret'];
+  if (syncSecret !== TELEGRAM_SYNC_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (!chatId) {
+    return res.status(400).json({ error: 'chatId query parameter required' });
+  }
+
+  const clientInfo = telegramClients.get(botId);
+  
+  if (!clientInfo) {
+    return res.status(404).json({ error: 'Bot não conectado' });
+  }
+
+  try {
+    // Get user entity by chat ID
+    const users = await clientInfo.client.invoke(
+      new Api.users.GetUsers({
+        id: [chatId],
+      })
+    );
+
+    if (!users || users.length === 0) {
+      return res.json({ 
+        status: 'unknown',
+        reason: 'user_not_found'
+      });
+    }
+
+    const user = users[0];
+    const userStatus = user.status;
+
+    // Parse the status
+    if (!userStatus) {
+      return res.json({ 
+        status: 'unknown',
+        reason: 'no_status'
+      });
+    }
+
+    const statusClassName = userStatus.className || userStatus.constructor?.name || '';
+    
+    // UserStatusOnline - user is currently online
+    if (statusClassName === 'UserStatusOnline' || statusClassName.includes('Online')) {
+      const expiresAt = userStatus.expires 
+        ? new Date(userStatus.expires * 1000).toISOString()
+        : null;
+      
+      return res.json({
+        status: 'online',
+        expiresAt,
+      });
+    }
+    
+    // UserStatusOffline - user was online at specific time
+    if (statusClassName === 'UserStatusOffline' || statusClassName.includes('Offline')) {
+      const wasOnlineAt = userStatus.wasOnline 
+        ? new Date(userStatus.wasOnline * 1000).toISOString()
+        : null;
+      
+      return res.json({
+        status: 'offline',
+        wasOnlineAt,
+      });
+    }
+    
+    // UserStatusRecently - online within last ~2-3 days
+    if (statusClassName === 'UserStatusRecently' || statusClassName.includes('Recently')) {
+      return res.json({
+        status: 'recently',
+      });
+    }
+    
+    // UserStatusLastWeek
+    if (statusClassName === 'UserStatusLastWeek' || statusClassName.includes('LastWeek')) {
+      return res.json({
+        status: 'lastWeek',
+      });
+    }
+    
+    // UserStatusLastMonth
+    if (statusClassName === 'UserStatusLastMonth' || statusClassName.includes('LastMonth')) {
+      return res.json({
+        status: 'lastMonth',
+      });
+    }
+    
+    // UserStatusEmpty or unknown
+    return res.json({
+      status: 'unknown',
+      reason: 'privacy_enabled',
+      rawStatus: statusClassName,
+    });
+
+  } catch (error) {
+    console.error(`❌ [${clientInfo.botName}] Erro ao obter status do usuário ${chatId}:`, error?.message || error);
+    res.status(500).json({ error: error.message || 'Failed to get user status' });
+  }
+});
+
 // Start server and connect bots
 async function start() {
   try {
