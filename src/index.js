@@ -10,11 +10,13 @@ const { TelegramClient, Api } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
 const { createClient } = require('@supabase/supabase-js');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 app.use(express.json());
 
-// Configuration - log what we have for debugging
+// ============= CONFIGURATION =============
 console.log('🔧 Verificando variáveis de ambiente...');
 console.log('   SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ definido' : '✗ NÃO definido');
 console.log('   SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ definido' : '✗ NÃO definido');
@@ -34,6 +36,24 @@ const SUPABASE_SERVICE_ROLE_KEY =
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const TELEGRAM_SYNC_SECRET = process.env.TELEGRAM_SYNC_SECRET;
 const PORT = process.env.PORT || 3000;
+
+// ============= RETRY & QUEUE CONFIGURATION =============
+const RETRY_CONFIG = {
+  maxRetries: 5,
+  baseDelayMs: 1000,
+  maxDelayMs: 30000,
+  backoffMultiplier: 2
+};
+
+const QUEUE_CONFIG = {
+  maxConcurrent: 3,        // Max concurrent sync requests
+  batchDelayMs: 100,       // Delay between batch items
+  maxQueueSize: 1000       // Max items in queue before dropping oldest
+};
+
+// Keep-alive agents for better connection reuse
+const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
+const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
 
 function getJwtRole(jwt) {
   try {
@@ -69,6 +89,95 @@ if (!supabaseAdmin) {
 
 // Map of Telegram clients (one per bot)
 const telegramClients = new Map();
+
+// ============= MESSAGE QUEUE SYSTEM =============
+class MessageQueue {
+  constructor() {
+    this.queue = [];
+    this.processing = false;
+    this.activeRequests = 0;
+    this.stats = {
+      processed: 0,
+      failed: 0,
+      retried: 0,
+      dropped: 0
+    };
+  }
+
+  enqueue(item) {
+    // Drop oldest items if queue is too large
+    if (this.queue.length >= QUEUE_CONFIG.maxQueueSize) {
+      const dropped = this.queue.shift();
+      this.stats.dropped++;
+      console.warn(`⚠️ Fila cheia, descartando mensagem antiga de [${dropped.botName}]`);
+    }
+    
+    this.queue.push({
+      ...item,
+      enqueuedAt: Date.now(),
+      retryCount: 0
+    });
+    
+    this.processQueue();
+  }
+
+  async processQueue() {
+    if (this.processing) return;
+    this.processing = true;
+
+    while (this.queue.length > 0 && this.activeRequests < QUEUE_CONFIG.maxConcurrent) {
+      const item = this.queue.shift();
+      this.activeRequests++;
+      
+      // Process item without awaiting to allow concurrency
+      this.processItem(item)
+        .catch(err => console.error('Queue processing error:', err))
+        .finally(() => {
+          this.activeRequests--;
+          // Continue processing if there are more items
+          if (this.queue.length > 0) {
+            setTimeout(() => this.processQueue(), QUEUE_CONFIG.batchDelayMs);
+          }
+        });
+    }
+
+    this.processing = false;
+  }
+
+  async processItem(item) {
+    try {
+      const success = await syncViaBackendFunctionWithRetry(
+        item.botName,
+        item.botTokenPrefix,
+        item.payload,
+        item.retryCount
+      );
+      
+      if (success) {
+        this.stats.processed++;
+        const mediaInfo = item.payload.fileUniqueId ? ` (mídia: ${item.payload.fileUniqueId})` : '';
+        console.log(`✅ [${item.botName}] Mensagem sincronizada${mediaInfo}`);
+      } else {
+        this.stats.failed++;
+      }
+    } catch (error) {
+      console.error(`❌ [${item.botName}] Erro fatal ao processar:`, error.message);
+      this.stats.failed++;
+    }
+  }
+
+  getStats() {
+    return {
+      ...this.stats,
+      queueSize: this.queue.length,
+      activeRequests: this.activeRequests
+    };
+  }
+}
+
+const messageQueue = new MessageQueue();
+
+// ============= UTILITY FUNCTIONS =============
 
 // Helper: Convert BigInt to String safely
 function bigIntToString(value) {
@@ -114,9 +223,33 @@ function extractSenderInfo(message) {
   };
 }
 
-// Helper: Download user profile photo (returns base64 - kept in database for simplicity)
+// Helper: Calculate exponential backoff delay
+function calculateBackoffDelay(retryCount) {
+  const delay = Math.min(
+    RETRY_CONFIG.baseDelayMs * Math.pow(RETRY_CONFIG.backoffMultiplier, retryCount),
+    RETRY_CONFIG.maxDelayMs
+  );
+  // Add jitter (±25%)
+  const jitter = delay * (0.75 + Math.random() * 0.5);
+  return Math.floor(jitter);
+}
+
+// Helper: Sleep with promise
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============= PROFILE PHOTO =============
+
+// Helper: Download user profile photo (returns base64)
 async function getProfilePhotoUrl(client, userPeer, botName) {
   try {
+    // Check if client is connected before attempting operation
+    if (!client.connected) {
+      console.log(`📷 [${botName}] Cliente desconectado, pulando foto de perfil`);
+      return null;
+    }
+    
     const entity = (typeof userPeer === 'object' && userPeer !== null)
       ? userPeer
       : await client.getEntity(userPeer);
@@ -147,63 +280,139 @@ async function getProfilePhotoUrl(client, userPeer, botName) {
     const base64 = Buffer.from(buffer).toString('base64');
     return `data:image/jpeg;base64,${base64}`;
   } catch (error) {
-    console.log(`📷 [${botName}] Não foi possível obter foto de perfil: ${error.message}`);
+    // Don't log connection-related errors as they're expected during reconnection
+    if (!error.message?.includes('disconnected') && !error.message?.includes('Not connected')) {
+      console.log(`📷 [${botName}] Não foi possível obter foto de perfil: ${error.message}`);
+    }
     return null;
   }
 }
 
+// ============= FETCH WITH RETRY =============
 
-// Sync message via backend function (avoids RLS issues on direct table writes)
-async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
-  const url = `${SUPABASE_URL}/functions/v1/telegram-mtproto-sync`;
-
+// Enhanced fetch with retry and backoff
+async function fetchWithRetry(url, options, retryCount = 0) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+  
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: SUPABASE_ANON_KEY,
-        'x-sync-secret': TELEGRAM_SYNC_SECRET,
-      },
-      body: JSON.stringify({
-        type: 'message',
-        data: {
-          ...payload,
-          botToken: botTokenPrefix,
-        },
-      }),
-    });
-
-    // Verbose diagnostics (safe to log URL + status; never log keys)
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`❌ [${botName}] Falha ao sincronizar (telegram-mtproto-sync):`, response.status, errorText);
-      console.error(`   URL: ${url}`);
-      return false;
-    }
-
-    const okText = await response.text().catch(() => '');
-    if (okText) {
-      console.log(`✅ [${botName}] Sync OK (${response.status}) -> ${url} | resp: ${okText.slice(0, 200)}`);
-    } else {
-      console.log(`✅ [${botName}] Sync OK (${response.status}) -> ${url}`);
-    }
-
-    return true;
+    const fetchOptions = {
+      ...options,
+      signal: controller.signal,
+      // Use keep-alive agent
+      agent: url.startsWith('https') ? httpsAgent : httpAgent
+    };
+    
+    const response = await fetch(url, fetchOptions);
+    clearTimeout(timeoutId);
+    return response;
   } catch (error) {
-    console.error(`❌ [${botName}] Erro ao chamar telegram-mtproto-sync:`, error);
-    console.error(`   URL: ${url}`);
-    return false;
+    clearTimeout(timeoutId);
+    
+    // Check if we should retry
+    const isRetryable = 
+      error.name === 'AbortError' ||
+      error.code === 'ECONNRESET' ||
+      error.code === 'ECONNREFUSED' ||
+      error.code === 'ETIMEDOUT' ||
+      error.message?.includes('fetch failed') ||
+      error.message?.includes('network');
+    
+    if (isRetryable && retryCount < RETRY_CONFIG.maxRetries) {
+      const delay = calculateBackoffDelay(retryCount);
+      console.log(`🔄 Retry ${retryCount + 1}/${RETRY_CONFIG.maxRetries} em ${delay}ms para ${url.split('/').pop()}`);
+      await sleep(delay);
+      return fetchWithRetry(url, options, retryCount + 1);
+    }
+    
+    throw error;
   }
 }
 
+// ============= SYNC FUNCTIONS =============
+
+// Sync message via backend function with retry
+async function syncViaBackendFunctionWithRetry(botName, botTokenPrefix, payload, initialRetryCount = 0) {
+  const url = `${SUPABASE_URL}/functions/v1/telegram-mtproto-sync`;
+  let retryCount = initialRetryCount;
+
+  while (retryCount <= RETRY_CONFIG.maxRetries) {
+    try {
+      const response = await fetchWithRetry(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: SUPABASE_ANON_KEY,
+          'x-sync-secret': TELEGRAM_SYNC_SECRET,
+        },
+        body: JSON.stringify({
+          type: 'message',
+          data: {
+            ...payload,
+            botToken: botTokenPrefix,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        
+        // Don't retry on 4xx errors (client errors)
+        if (response.status >= 400 && response.status < 500) {
+          console.error(`❌ [${botName}] Erro cliente (${response.status}):`, errorText);
+          return false;
+        }
+        
+        // Retry on 5xx errors
+        if (retryCount < RETRY_CONFIG.maxRetries) {
+          const delay = calculateBackoffDelay(retryCount);
+          console.warn(`⚠️ [${botName}] Erro ${response.status}, retry em ${delay}ms...`);
+          messageQueue.stats.retried++;
+          await sleep(delay);
+          retryCount++;
+          continue;
+        }
+        
+        console.error(`❌ [${botName}] Falha após ${RETRY_CONFIG.maxRetries} tentativas:`, errorText);
+        return false;
+      }
+
+      const okText = await response.text().catch(() => '');
+      if (okText) {
+        console.log(`✅ [${botName}] Sync OK (${response.status}) | resp: ${okText.slice(0, 100)}`);
+      }
+      return true;
+      
+    } catch (error) {
+      if (retryCount >= RETRY_CONFIG.maxRetries) {
+        console.error(`❌ [${botName}] Erro fatal após retries:`, error.message);
+        return false;
+      }
+      
+      const delay = calculateBackoffDelay(retryCount);
+      console.warn(`⚠️ [${botName}] Erro de rede, retry ${retryCount + 1} em ${delay}ms:`, error.message);
+      messageQueue.stats.retried++;
+      await sleep(delay);
+      retryCount++;
+    }
+  }
+  
+  return false;
+}
+
+// Legacy sync function (direct call without queue)
+async function syncViaBackendFunction(botName, botTokenPrefix, payload) {
+  return syncViaBackendFunctionWithRetry(botName, botTokenPrefix, payload, 0);
+}
+
+// ============= MEDIA HANDLING =============
+
 // Helper: Upload media to storage via edge function (with deduplication)
-// Returns { fileUniqueId, publicUrl } or null
 async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, mediaType, botName) {
   const url = `${SUPABASE_URL}/functions/v1/upload-telegram-media`;
   
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -234,7 +443,6 @@ async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, 
       } else {
         console.log(`☁️ [${botName}] Mídia enviada para storage: ${result.storagePath}`);
       }
-      // Return both fileUniqueId and publicUrl for reference
       return { 
         fileUniqueId: fileUniqueId, 
         publicUrl: result.publicUrl 
@@ -243,7 +451,7 @@ async function uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, 
     
     return null;
   } catch (error) {
-    console.error(`❌ [${botName}] Erro ao fazer upload de mídia:`, error);
+    console.error(`❌ [${botName}] Erro ao fazer upload de mídia:`, error.message);
     return null;
   }
 }
@@ -339,10 +547,15 @@ function getMediaInfo(message) {
   return null;
 }
 
-// Helper: Download message media (photo/doc/sticker/animation) and upload to storage (with deduplication)
-// Returns { fileUniqueId, publicUrl } or null
+// Helper: Download message media with connection check
 async function downloadMessageMedia(client, message, botName, botId) {
   try {
+    // Check if client is connected
+    if (!client.connected) {
+      console.log(`📎 [${botName}] Cliente desconectado, pulando download de mídia`);
+      return null;
+    }
+    
     const mediaInfo = getMediaInfo(message);
     
     if (!mediaInfo) return null;
@@ -353,18 +566,35 @@ async function downloadMessageMedia(client, message, botName, botId) {
       : mediaInfo.type;
     console.log(`📎 [${botName}] Processando mídia: ${mediaDesc} (${mediaInfo.mimeType})`);
     
-    // Handle animated stickers (TGS) - skip for now as they're complex Lottie files
+    // Handle animated stickers (TGS) - skip for now
     if (mediaInfo.type === 'sticker' && mediaInfo.subType === 'animated') {
-      console.log(`⏭️ [${botName}] Sticker animado (TGS) ignorado - formato Lottie não suportado`);
+      console.log(`⏭️ [${botName}] Sticker animado (TGS) ignorado`);
       return null;
     }
     
-    // Download media
+    // Download media with timeout and connection check
     let buffer = null;
     try {
-      buffer = await client.downloadMedia(mediaInfo.mediaObject);
+      // Check connection again right before download
+      if (!client.connected) {
+        console.log(`📎 [${botName}] Cliente desconectou antes do download`);
+        return null;
+      }
+      
+      buffer = await Promise.race([
+        client.downloadMedia(mediaInfo.mediaObject),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Download timeout')), 60000)
+        )
+      ]);
     } catch (downloadError) {
-      console.error(`📎 [${botName}] Erro no download:`, downloadError?.message);
+      // Don't log connection errors as they're expected
+      if (!downloadError.message?.includes('disconnected') && 
+          !downloadError.message?.includes('Not connected')) {
+        console.error(`📎 [${botName}] Erro no download:`, downloadError?.message);
+      } else {
+        console.log(`📎 [${botName}] Download cancelado: cliente desconectado`);
+      }
       return null;
     }
 
@@ -373,9 +603,8 @@ async function downloadMessageMedia(client, message, botName, botId) {
       return null;
     }
     
-    // Validate buffer is actually binary data
+    // Convert buffer if needed
     if (typeof buffer === 'string') {
-      console.warn(`📎 [${botName}] Buffer retornado como string, convertendo...`);
       buffer = Buffer.from(buffer, 'binary');
     }
     
@@ -388,7 +617,6 @@ async function downloadMessageMedia(client, message, botName, botId) {
       const crypto = require('crypto');
       const hash = crypto.createHash('md5').update(buffer).digest('hex').substring(0, 16);
       fileUniqueId = `gen_${hash}`;
-      console.log(`📎 [${botName}] Gerado fileUniqueId de fallback: ${fileUniqueId}`);
     }
 
     // Determine the correct extension based on media type
@@ -409,24 +637,19 @@ async function downloadMessageMedia(client, message, botName, botId) {
       storageMediaType = 'animation';
     }
 
-    // Ensure buffer is a proper Buffer before base64 encoding
+    // Ensure buffer is proper Buffer before base64 encoding
     const properBuffer = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
     const base64 = properBuffer.toString('base64');
     
-    // Validate base64 output
     if (!base64 || base64.length === 0) {
       console.error(`📎 [${botName}] Falha ao converter buffer para base64`);
       return null;
     }
     
-    // Don't include data URI prefix - send raw base64
-    // The edge function will handle adding the prefix if needed
-    const base64Data = base64;
-    
     console.log(`📎 [${botName}] Mídia baixada: ${Math.round(properBuffer.length / 1024)}KB (${mimeType}) [ID: ${fileUniqueId}]`);
     
-    // Upload to storage with deduplication - returns { fileUniqueId, publicUrl }
-    const result = await uploadMediaToStorage(base64Data, mimeType, fileUniqueId, fileId, botId, storageMediaType, botName);
+    // Upload to storage with deduplication
+    const result = await uploadMediaToStorage(base64, mimeType, fileUniqueId, fileId, botId, storageMediaType, botName);
     
     if (!result) {
       console.warn(`⚠️ [${botName}] Upload falhou, mídia não será salva`);
@@ -435,11 +658,15 @@ async function downloadMessageMedia(client, message, botName, botId) {
     
     return result;
   } catch (error) {
-    console.error(`📎 [${botName}] Erro ao baixar mídia:`, error?.message || error);
+    // Don't log connection errors
+    if (!error.message?.includes('disconnected') && !error.message?.includes('Not connected')) {
+      console.error(`📎 [${botName}] Erro ao baixar mídia:`, error?.message || error);
+    }
     return null;
   }
 }
 
+// ============= MESSAGE HANDLER =============
 
 // Create message handler for a specific bot
 function createMessageHandler(botId, botName, botTokenPrefix) {
@@ -482,17 +709,16 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         const cacheKey = chatId;
         const cachedPhoto = photoCache.get(cacheKey);
 
-        // Use cache if we have a non-null photo fetched in the last hour
+        // Use cache if available (1 hour)
         if (cachedPhoto?.url && (Date.now() - cachedPhoto.timestamp) < 3600000) {
           profilePhotoUrl = cachedPhoto.url;
         } else {
           // Fetch new photo
           const clientInfo = telegramClients.get(botId);
-          if (clientInfo) {
+          if (clientInfo && clientInfo.client.connected) {
             const userPeer = message._sender || message.sender || message.senderId || chatId;
             profilePhotoUrl = await getProfilePhotoUrl(clientInfo.client, userPeer, botName);
 
-            // Only cache when we actually got an URL (avoid caching null for 1h)
             if (profilePhotoUrl) {
               photoCache.set(cacheKey, { url: profilePhotoUrl, timestamp: Date.now() });
             } else {
@@ -502,11 +728,11 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         }
       }
 
-      // Download message media if present - returns { fileUniqueId, publicUrl } or null
+      // Download message media if present
       let mediaResult = null;
       if (hasMedia) {
         const clientInfo = telegramClients.get(botId);
-        if (clientInfo) {
+        if (clientInfo && clientInfo.client.connected) {
           mediaResult = await downloadMessageMedia(clientInfo.client, message, botName, botId);
         }
       }
@@ -515,7 +741,6 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
       let replyMarkup = null;
       const rmCandidate = message.replyMarkup ?? null;
 
-      // Extract buttons (ReplyInlineMarkup -> rows -> buttons)
       if (rmCandidate?.rows && Array.isArray(rmCandidate.rows)) {
         replyMarkup = {
           rows: rmCandidate.rows.map((row) => ({
@@ -538,7 +763,7 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
         );
       }
 
-      // Build payload with fileUniqueId instead of mediaUrl
+      // Build payload
       const payload = {
         chatId: String(chatId),
         messageId: String(bigIntToString(message.id)),
@@ -552,22 +777,31 @@ function createMessageHandler(botId, botName, botTokenPrefix) {
           isBot: senderInfo.isBot,
         },
         profilePhotoUrl,
-        fileUniqueId: mediaResult?.fileUniqueId || null, // Send fileUniqueId instead of mediaUrl
+        fileUniqueId: mediaResult?.fileUniqueId || null,
         replyMarkup,
       };
 
-      // Sync via backend function
-      const success = await syncViaBackendFunction(botName, botTokenPrefix, payload);
-      if (success) {
-        console.log(`✅ [${botName}] Mensagem sincronizada${mediaResult ? ' (com mídia: ' + mediaResult.fileUniqueId + ')' : ''}`);
-      }
+      // Enqueue message for processing (with retry/backoff)
+      messageQueue.enqueue({
+        botName,
+        botTokenPrefix,
+        payload
+      });
+      
     } catch (error) {
-      console.error(`[${botName}] Erro ao processar mensagem:`, error);
+      // Don't log expected connection errors
+      if (!error.message?.includes('TIMEOUT') && 
+          !error.message?.includes('disconnected') &&
+          !error.message?.includes('Not connected')) {
+        console.error(`[${botName}] Erro ao processar mensagem:`, error);
+      }
     }
   };
 }
 
-// Connect a specific bot
+// ============= BOT CONNECTION MANAGEMENT =============
+
+// Connect a specific bot with enhanced reconnection handling
 async function connectBot(bot) {
   const { id: botId, nome: botName, api_token: botToken } = bot;
 
@@ -578,8 +812,14 @@ async function connectBot(bot) {
 
   // Check if already connected
   if (telegramClients.has(botId)) {
-    console.log(`ℹ️ [${botName}] Já conectado`);
-    return true;
+    const existing = telegramClients.get(botId);
+    if (existing.client.connected) {
+      console.log(`ℹ️ [${botName}] Já conectado`);
+      return true;
+    }
+    // Client exists but disconnected, remove and reconnect
+    console.log(`🔄 [${botName}] Reconectando cliente desconectado...`);
+    await disconnectBot(botId);
   }
 
   try {
@@ -590,11 +830,17 @@ async function connectBot(bot) {
       API_ID,
       API_HASH,
       {
-        connectionRetries: 5,
-        retryDelay: 1000,
-        autoReconnect: true
+        connectionRetries: 10,
+        retryDelay: 2000,
+        autoReconnect: true,
+        // Additional options for stability
+        requestRetries: 5,
+        timeout: 30
       }
     );
+
+    // Add connection error handler
+    client.setLogLevel('warn'); // Reduce verbose logging
 
     await client.start({
       botAuthToken: botToken,
@@ -617,6 +863,7 @@ async function connectBot(bot) {
       client, 
       botName, 
       botUsername: me.username,
+      botToken: botToken,
       connectedAt: new Date().toISOString()
     });
 
@@ -638,16 +885,49 @@ async function disconnectBot(botId) {
       console.log(`🔌 [${clientInfo.botName}] Desconectado`);
     } catch (error) {
       console.error(`Erro ao desconectar bot ${botId}:`, error);
+      telegramClients.delete(botId);
     }
   }
 }
+
+// Periodic health check and reconnection
+async function healthCheckAndReconnect() {
+  for (const [botId, clientInfo] of telegramClients) {
+    if (!clientInfo.client.connected) {
+      console.log(`🔄 [${clientInfo.botName}] Detectado desconectado, tentando reconectar...`);
+      
+      // Try to reconnect using stored token
+      try {
+        await clientInfo.client.connect();
+        console.log(`✅ [${clientInfo.botName}] Reconectado com sucesso`);
+      } catch (error) {
+        console.error(`❌ [${clientInfo.botName}] Falha ao reconectar:`, error.message);
+        
+        // If reconnect fails, try full reconnection
+        if (clientInfo.botToken) {
+          telegramClients.delete(botId);
+          await connectBot({
+            id: botId,
+            nome: clientInfo.botName,
+            api_token: clientInfo.botToken
+          });
+        }
+      }
+    }
+  }
+}
+
+// Start periodic health check (every 30 seconds)
+setInterval(healthCheckAndReconnect, 30000);
+
+// ============= LOAD BOTS =============
 
 // Load and connect all bots via Edge Function
 async function loadAndConnectBots() {
   console.log('📋 Carregando bots via Edge Function...');
 
   try {
-    const response = await fetch(`${SUPABASE_URL}/functions/v1/telegram-bots-list`, {
+    const response = await fetchWithRetry(`${SUPABASE_URL}/functions/v1/telegram-bots-list`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -665,12 +945,14 @@ async function loadAndConnectBots() {
     const { bots } = await response.json();
     console.log(`📊 Encontrados ${bots.length} bots ativos com token`);
 
-  // Connect each bot
-  let connectedCount = 0;
-  for (const bot of bots) {
-    const success = await connectBot(bot);
-    if (success) connectedCount++;
-  }
+    // Connect each bot with small delay between to avoid rate limiting
+    let connectedCount = 0;
+    for (const bot of bots) {
+      const success = await connectBot(bot);
+      if (success) connectedCount++;
+      // Small delay between bot connections
+      await sleep(500);
+    }
 
     console.log(`\n🚀 ${connectedCount}/${bots.length} bots conectados via MTProto`);
 
@@ -679,21 +961,28 @@ async function loadAndConnectBots() {
   }
 }
 
-// === HTTP Endpoints ===
+// ============= HTTP ENDPOINTS =============
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     connectedBots: telegramClients.size,
+    queue: messageQueue.getStats(),
     bots: Array.from(telegramClients.entries()).map(([id, info]) => ({
       id,
       name: info.botName,
       username: info.botUsername,
+      connected: info.client.connected,
       connectedAt: info.connectedAt
     })),
     timestamp: new Date().toISOString()
   });
+});
+
+// Queue stats endpoint
+app.get('/queue-stats', (req, res) => {
+  res.json(messageQueue.getStats());
 });
 
 // Reload all bots (called by Lovable when a new token is added)
@@ -782,7 +1071,7 @@ app.get('/status/:botId', (req, res) => {
 
   if (clientInfo) {
     res.json({
-      connected: true,
+      connected: clientInfo.client.connected,
       botId,
       botName: clientInfo.botName,
       botUsername: clientInfo.botUsername,
@@ -799,273 +1088,117 @@ app.get('/status/:botId', (req, res) => {
 // Send message via a specific bot
 app.post('/send/:botId', async (req, res) => {
   const { botId } = req.params;
-  const { chatId, text } = req.body;
+  const { chatId, message, parseMode } = req.body;
 
   const clientInfo = telegramClients.get(botId);
-  
+
   if (!clientInfo) {
     return res.status(404).json({ error: 'Bot não conectado' });
   }
 
+  if (!clientInfo.client.connected) {
+    return res.status(503).json({ error: 'Bot desconectado temporariamente' });
+  }
+
   try {
-    const result = await clientInfo.client.sendMessage(chatId, { message: text });
+    const result = await clientInfo.client.sendMessage(chatId, {
+      message,
+      parseMode: parseMode || 'html'
+    });
+
     res.json({
       success: true,
       messageId: bigIntToString(result.id)
     });
   } catch (error) {
-    console.error(`Erro ao enviar mensagem [${clientInfo.botName}]:`, error);
+    console.error(`[${clientInfo.botName}] Erro ao enviar mensagem:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Edit message via a specific bot
-app.post('/edit/:botId', async (req, res) => {
+// Get user status endpoint
+app.post('/user-status/:botId', async (req, res) => {
   const { botId } = req.params;
-  const { chatId, messageId, text } = req.body;
+  const { chatId } = req.body;
 
   const clientInfo = telegramClients.get(botId);
-  
+
   if (!clientInfo) {
     return res.status(404).json({ error: 'Bot não conectado' });
   }
 
-  try {
-    await clientInfo.client.invoke(
-      new Api.messages.EditMessage({
-        peer: chatId,
-        id: parseInt(messageId),
-        message: text,
-      })
-    );
-    
-    console.log(`✏️ [${clientInfo.botName}] Mensagem ${messageId} editada no chat ${chatId}`);
-    res.json({
-      success: true,
-      messageId,
-      chatId
-    });
-  } catch (error) {
-    console.error(`Erro ao editar mensagem [${clientInfo.botName}]:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Delete message via a specific bot
-app.post('/delete/:botId', async (req, res) => {
-  const { botId } = req.params;
-  const { chatId, messageId } = req.body;
-
-  const clientInfo = telegramClients.get(botId);
-  
-  if (!clientInfo) {
-    return res.status(404).json({ error: 'Bot não conectado' });
+  if (!clientInfo.client.connected) {
+    return res.status(503).json({ error: 'Bot desconectado temporariamente' });
   }
 
   try {
-    await clientInfo.client.invoke(
-      new Api.messages.DeleteMessages({
-        id: [parseInt(messageId)],
-        revoke: true, // Delete for both sides
-      })
-    );
+    const user = await clientInfo.client.getEntity(chatId);
     
-    console.log(`🗑️ [${clientInfo.botName}] Mensagem ${messageId} deletada do chat ${chatId}`);
-    res.json({
-      success: true,
-      messageId,
-      chatId
-    });
-  } catch (error) {
-    console.error(`Erro ao deletar mensagem [${clientInfo.botName}]:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
+    let status = 'unknown';
+    let wasOnline = null;
 
-// Delete multiple messages via a specific bot
-app.post('/delete-messages/:botId', async (req, res) => {
-  const { botId } = req.params;
-  const { chatId, messageIds } = req.body;
-
-  const clientInfo = telegramClients.get(botId);
-  
-  if (!clientInfo) {
-    return res.status(404).json({ error: 'Bot não conectado' });
-  }
-
-  try {
-    const ids = messageIds.map(id => parseInt(id));
-    
-    await clientInfo.client.invoke(
-      new Api.messages.DeleteMessages({
-        id: ids,
-        revoke: true, // Delete for both sides
-      })
-    );
-    
-    console.log(`🗑️ [${clientInfo.botName}] ${ids.length} mensagens deletadas do chat ${chatId}`);
-    res.json({
-      success: true,
-      deletedCount: ids.length,
-      chatId
-    });
-  } catch (error) {
-    console.error(`Erro ao deletar mensagens [${clientInfo.botName}]:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get user online status via MTProto
-app.get('/user-status/:botId', async (req, res) => {
-  const { botId } = req.params;
-  const { chatId } = req.query;
-  
-  // Validate sync secret for security
-  const syncSecret = req.headers['x-sync-secret'];
-  if (syncSecret !== TELEGRAM_SYNC_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (!chatId) {
-    return res.status(400).json({ error: 'chatId query parameter required' });
-  }
-
-  const clientInfo = telegramClients.get(botId);
-  
-  if (!clientInfo) {
-    return res.status(404).json({ error: 'Bot não conectado' });
-  }
-
-  try {
-    // Get user entity by chat ID
-    const users = await clientInfo.client.invoke(
-      new Api.users.GetUsers({
-        id: [chatId],
-      })
-    );
-
-    if (!users || users.length === 0) {
-      return res.json({ 
-        status: 'unknown',
-        reason: 'user_not_found'
-      });
-    }
-
-    const user = users[0];
-    const userStatus = user.status;
-
-    // Parse the status
-    if (!userStatus) {
-      return res.json({ 
-        status: 'unknown',
-        reason: 'no_status'
-      });
-    }
-
-    const statusClassName = userStatus.className || userStatus.constructor?.name || '';
-    
-    // UserStatusOnline - user is currently online
-    if (statusClassName === 'UserStatusOnline' || statusClassName.includes('Online')) {
-      const expiresAt = userStatus.expires 
-        ? new Date(userStatus.expires * 1000).toISOString()
-        : null;
+    if (user.status) {
+      const statusClassName = user.status.className;
       
-      return res.json({
-        status: 'online',
-        expiresAt,
-      });
+      if (statusClassName === 'UserStatusOnline') {
+        status = 'online';
+      } else if (statusClassName === 'UserStatusOffline') {
+        status = 'offline';
+        wasOnline = user.status.wasOnline 
+          ? new Date(user.status.wasOnline * 1000).toISOString()
+          : null;
+      } else if (statusClassName === 'UserStatusRecently') {
+        status = 'recently';
+      } else if (statusClassName === 'UserStatusLastWeek') {
+        status = 'last_week';
+      } else if (statusClassName === 'UserStatusLastMonth') {
+        status = 'last_month';
+      }
     }
-    
-    // UserStatusOffline - user was online at specific time
-    if (statusClassName === 'UserStatusOffline' || statusClassName.includes('Offline')) {
-      const wasOnlineAt = userStatus.wasOnline 
-        ? new Date(userStatus.wasOnline * 1000).toISOString()
-        : null;
-      
-      return res.json({
-        status: 'offline',
-        wasOnlineAt,
-      });
-    }
-    
-    // UserStatusRecently - online within last ~2-3 days
-    if (statusClassName === 'UserStatusRecently' || statusClassName.includes('Recently')) {
-      return res.json({
-        status: 'recently',
-      });
-    }
-    
-    // UserStatusLastWeek
-    if (statusClassName === 'UserStatusLastWeek' || statusClassName.includes('LastWeek')) {
-      return res.json({
-        status: 'lastWeek',
-      });
-    }
-    
-    // UserStatusLastMonth
-    if (statusClassName === 'UserStatusLastMonth' || statusClassName.includes('LastMonth')) {
-      return res.json({
-        status: 'lastMonth',
-      });
-    }
-    
-    // UserStatusEmpty or unknown
-    return res.json({
-      status: 'unknown',
-      reason: 'privacy_enabled',
-      rawStatus: statusClassName,
-    });
 
+    res.json({
+      success: true,
+      status,
+      wasOnline,
+      firstName: user.firstName || null,
+      lastName: user.lastName || null,
+      username: user.username || null
+    });
   } catch (error) {
-    console.error(`❌ [${clientInfo.botName}] Erro ao obter status do usuário ${chatId}:`, error?.message || error);
-    res.status(500).json({ error: error.message || 'Failed to get user status' });
+    console.error(`[${clientInfo.botName}] Erro ao buscar status:`, error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Start server and connect bots
-async function start() {
-  try {
-    // Validate Telegram config
-    if (!API_ID || !API_HASH) {
-      console.error('❌ TELEGRAM_API_ID e TELEGRAM_API_HASH são obrigatórios!');
-      console.error('   Obtenha em: https://my.telegram.org/apps');
-      process.exit(1);
-    }
+// ============= START SERVER =============
 
-    if (!TELEGRAM_SYNC_SECRET) {
-      console.error('❌ TELEGRAM_SYNC_SECRET é obrigatório!');
-      process.exit(1);
-    }
+app.listen(PORT, async () => {
+  console.log(`\n🌐 Servidor MTProto rodando na porta ${PORT}`);
+  console.log(`   Health check: http://localhost:${PORT}/health`);
+  console.log(`   Queue stats: http://localhost:${PORT}/queue-stats`);
+  console.log('');
+  
+  // Load and connect bots on startup
+  await loadAndConnectBots();
+});
 
-    // Start Express server
-    app.listen(PORT, () => {
-      console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
-    });
-
-    // Connect bots
-    await loadAndConnectBots();
-
-    // Graceful shutdown
-    process.on('SIGINT', async () => {
-      console.log('\n🛑 Encerrando...');
-      for (const [botId] of telegramClients) {
-        await disconnectBot(botId);
-      }
-      process.exit(0);
-    });
-
-    process.on('SIGTERM', async () => {
-      console.log('\n🛑 Recebido SIGTERM, encerrando...');
-      for (const [botId] of telegramClients) {
-        await disconnectBot(botId);
-      }
-      process.exit(0);
-    });
-
-  } catch (error) {
-    console.error('Falha ao iniciar:', error);
-    process.exit(1);
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('⚠️ Recebido SIGTERM, desconectando bots...');
+  
+  for (const [botId] of telegramClients) {
+    await disconnectBot(botId);
   }
-}
+  
+  process.exit(0);
+});
 
-start();
+process.on('SIGINT', async () => {
+  console.log('⚠️ Recebido SIGINT, desconectando bots...');
+  
+  for (const [botId] of telegramClients) {
+    await disconnectBot(botId);
+  }
+  
+  process.exit(0);
+});
