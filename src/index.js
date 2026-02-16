@@ -14,7 +14,7 @@ const http = require('http');
 const https = require('https');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // ============= CONFIGURATION =============
 console.log('🔧 Verificando variáveis de ambiente...');
@@ -1064,6 +1064,109 @@ app.post('/disconnect/:botId', async (req, res) => {
   res.json({ success: true, botId });
 });
 
+// Health check all bots (for automated monitoring)
+app.get('/health-check-bots', async (req, res) => {
+  const syncSecret = req.headers['x-sync-secret'];
+  
+  if (syncSecret !== TELEGRAM_SYNC_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  console.log('🏥 Health check de todos os bots iniciado...');
+  const results = [];
+
+  for (const [botId, clientInfo] of telegramClients) {
+    const result = {
+      botId,
+      botName: clientInfo.botName,
+      platform: 'apex', // Will be enriched by the Edge Function
+      status: 'healthy',
+      error: null
+    };
+
+    try {
+      // Check if client is connected
+      if (!clientInfo.client.connected) {
+        console.log(`🔄 [${clientInfo.botName}] Desconectado, tentando reconectar...`);
+        
+        // Try to reconnect before marking as problematic
+        try {
+          await clientInfo.client.connect();
+          console.log(`✅ [${clientInfo.botName}] Reconectado com sucesso`);
+        } catch (reconnectError) {
+          const errorMsg = reconnectError.message || String(reconnectError);
+          
+          if (errorMsg.includes('USER_DEACTIVATED') || errorMsg.includes('USER_DEACTIVATED_BAN')) {
+            result.status = 'banned';
+            result.error = errorMsg;
+            console.log(`🚫 [${clientInfo.botName}] Bot BANIDO: ${errorMsg}`);
+          } else if (errorMsg.includes('AUTH_KEY_UNREGISTERED') || errorMsg.includes('SESSION_REVOKED')) {
+            result.status = 'auth_error';
+            result.error = errorMsg;
+            console.log(`🔑 [${clientInfo.botName}] Erro de autenticação: ${errorMsg}`);
+          } else {
+            result.status = 'disconnected';
+            result.error = errorMsg;
+            console.log(`🔌 [${clientInfo.botName}] Desconectado: ${errorMsg}`);
+          }
+          
+          results.push(result);
+          continue;
+        }
+      }
+
+      // Client is connected, verify with getMe()
+      try {
+        const me = await Promise.race([
+          clientInfo.client.getMe(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('getMe timeout')), 15000)
+          )
+        ]);
+        
+        result.status = 'healthy';
+        console.log(`✅ [${clientInfo.botName}] Saudável (@${me.username})`);
+      } catch (getMeError) {
+        const errorMsg = getMeError.message || String(getMeError);
+        
+        if (errorMsg.includes('USER_DEACTIVATED') || errorMsg.includes('USER_DEACTIVATED_BAN')) {
+          result.status = 'banned';
+          result.error = errorMsg;
+          console.log(`🚫 [${clientInfo.botName}] Bot BANIDO: ${errorMsg}`);
+        } else if (errorMsg.includes('AUTH_KEY_UNREGISTERED') || errorMsg.includes('SESSION_REVOKED')) {
+          result.status = 'auth_error';
+          result.error = errorMsg;
+          console.log(`🔑 [${clientInfo.botName}] Erro de autenticação: ${errorMsg}`);
+        } else if (errorMsg.includes('timeout')) {
+          result.status = 'unreachable';
+          result.error = 'Bot não respondeu ao getMe() em 15s';
+          console.log(`⏱️ [${clientInfo.botName}] Timeout no getMe()`);
+        } else {
+          result.status = 'disconnected';
+          result.error = errorMsg;
+          console.log(`🔌 [${clientInfo.botName}] Erro: ${errorMsg}`);
+        }
+      }
+    } catch (error) {
+      result.status = 'unreachable';
+      result.error = error.message || 'Erro desconhecido';
+      console.log(`❓ [${clientInfo.botName}] Erro inesperado: ${error.message}`);
+    }
+
+    results.push(result);
+  }
+
+  console.log(`🏥 Health check concluído: ${results.length} bots verificados`);
+  console.log(`   ✅ Saudáveis: ${results.filter(r => r.status === 'healthy').length}`);
+  console.log(`   ⚠️ Problemáticos: ${results.filter(r => r.status !== 'healthy').length}`);
+
+  res.json({
+    results,
+    totalConnected: telegramClients.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Status of a specific bot
 app.get('/status/:botId', (req, res) => {
   const { botId } = req.params;
@@ -1166,6 +1269,68 @@ app.post('/user-status/:botId', async (req, res) => {
     });
   } catch (error) {
     console.error(`[${clientInfo.botName}] Erro ao buscar status:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send file/audio via a specific bot (MTProto)
+app.post('/send-file/:botId', async (req, res) => {
+  const { botId } = req.params;
+  const { chatId, fileBase64, mimeType, fileName, caption, voice } = req.body;
+
+  const clientInfo = telegramClients.get(botId);
+
+  if (!clientInfo) {
+    return res.status(404).json({ error: 'Bot não conectado' });
+  }
+
+  if (!clientInfo.client.connected) {
+    return res.status(503).json({ error: 'Bot desconectado temporariamente' });
+  }
+
+  if (!chatId || !fileBase64) {
+    return res.status(400).json({ error: 'chatId e fileBase64 são obrigatórios' });
+  }
+
+  try {
+    // Decode base64 to buffer
+    let cleanBase64 = fileBase64;
+    if (cleanBase64.startsWith('data:')) {
+      const match = cleanBase64.match(/^data:[^;]+;base64,(.+)$/s);
+      if (match) cleanBase64 = match[1];
+    }
+    cleanBase64 = cleanBase64.replace(/[\s\r\n]+/g, '');
+
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    console.log(`📤 [${clientInfo.botName}] Enviando arquivo ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType || 'unknown'}) para chat ${chatId}`);
+
+    // Build send attributes
+    const sendOptions = {
+      file: new Api.InputFile({
+        id: BigInt(Date.now()),
+        parts: 1,
+        name: fileName || 'audio.ogg',
+        md5Checksum: ''
+      }),
+    };
+
+    // Use sendFile for voice/audio
+    const result = await clientInfo.client.sendFile(chatId, {
+      file: buffer,
+      caption: caption || '',
+      voiceNote: voice === true, // Send as voice note
+      fileName: fileName || (voice ? 'voice.ogg' : 'audio.mp3'),
+      mimeType: mimeType || 'audio/ogg',
+    });
+
+    console.log(`✅ [${clientInfo.botName}] Arquivo enviado, messageId: ${bigIntToString(result.id)}`);
+
+    res.json({
+      success: true,
+      messageId: bigIntToString(result.id)
+    });
+  } catch (error) {
+    console.error(`[${clientInfo.botName}] Erro ao enviar arquivo:`, error);
     res.status(500).json({ error: error.message });
   }
 });
