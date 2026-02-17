@@ -14,7 +14,15 @@ const http = require('http');
 const https = require('https');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+// Only parse JSON for non-multipart requests (multipart is parsed manually)
+app.use((req, res, next) => {
+  const ct = req.headers['content-type'] || '';
+  if (ct.includes('multipart/form-data')) {
+    next(); // Skip JSON parsing for multipart
+  } else {
+    express.json({ limit: '50mb' })(req, res, next);
+  }
+});
 
 // ============= CONFIGURATION =============
 console.log('🔧 Verificando variáveis de ambiente...');
@@ -1275,26 +1283,125 @@ app.post('/user-status/:botId', async (req, res) => {
 
 // Send file/audio via a specific bot (MTProto)
 // Supports both JSON (fileBase64) and multipart form-data (file upload)
-const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+// No external dependencies (multer removed) - uses native multipart parsing
 
-app.post('/send-file/:botId', upload.single('message'), async (req, res) => {
+// Native multipart parser (no multer needed)
+function parseMultipart(buf, boundary) {
+  const parts = [];
+  const boundaryBuf = Buffer.from('--' + boundary);
+  let start = 0;
+
+  while (true) {
+    const idx = buf.indexOf(boundaryBuf, start);
+    if (idx === -1) break;
+
+    if (start > 0) {
+      // Extract part between previous boundary and this one (minus trailing \r\n)
+      let partEnd = idx - 2; // skip \r\n before boundary
+      if (partEnd < start) partEnd = idx;
+      const partBuf = buf.slice(start, partEnd);
+
+      // Split headers from body (double CRLF)
+      const headerEnd = partBuf.indexOf('\r\n\r\n');
+      if (headerEnd !== -1) {
+        const headerStr = partBuf.slice(0, headerEnd).toString('utf-8');
+        const body = partBuf.slice(headerEnd + 4);
+
+        const headers = {};
+        headerStr.split('\r\n').forEach(line => {
+          const colonIdx = line.indexOf(':');
+          if (colonIdx > 0) {
+            headers[line.slice(0, colonIdx).trim().toLowerCase()] = line.slice(colonIdx + 1).trim();
+          }
+        });
+
+        const cd = headers['content-disposition'] || '';
+        const nameMatch = cd.match(/name="([^"]+)"/);
+        const fileNameMatch = cd.match(/filename="([^"]+)"/);
+        const contentType = headers['content-type'] || null;
+
+        parts.push({
+          name: nameMatch ? nameMatch[1] : null,
+          filename: fileNameMatch ? fileNameMatch[1] : null,
+          contentType,
+          data: body,
+        });
+      }
+    }
+
+    start = idx + boundaryBuf.length;
+    // Skip \r\n or -- after boundary
+    if (buf[start] === 0x2d && buf[start + 1] === 0x2d) break; // --
+    if (buf[start] === 0x0d && buf[start + 1] === 0x0a) start += 2;
+  }
+
+  return parts;
+}
+
+app.post('/send-file/:botId', async (req, res) => {
   const { botId } = req.params;
 
-  // Support both multipart form-data and JSON body
   let chatId, buffer, mimeType, fileName, caption, voice;
 
-  if (req.file) {
-    // Multipart form-data (from n8n binary upload)
-    chatId = req.body.chatId || req.body.chat_id;
-    buffer = req.file.buffer;
-    mimeType = req.file.mimetype || 'audio/ogg';
-    fileName = req.file.originalname || 'voice.ogg';
-    caption = req.body.caption || '';
-    voice = req.body.voice === 'true' || req.body.voice === true || fileName.endsWith('.ogg');
-    console.log(`📥 Recebido arquivo multipart: ${fileName} (${mimeType}, ${Math.round(buffer.length / 1024)}KB)`);
+  const contentType = req.headers['content-type'] || '';
+
+  if (contentType.includes('multipart/form-data')) {
+    // Parse multipart manually (no multer)
+    const boundaryMatch = contentType.match(/boundary=(.+)/);
+    if (!boundaryMatch) {
+      return res.status(400).json({ error: 'Missing multipart boundary' });
+    }
+
+    // Collect raw body
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const rawBody = Buffer.concat(chunks);
+
+    const parts = parseMultipart(rawBody, boundaryMatch[1].trim());
+    const fields = {};
+    let fileData = null;
+
+    for (const part of parts) {
+      if (part.filename) {
+        fileData = part;
+      } else if (part.name) {
+        fields[part.name] = part.data.toString('utf-8');
+      }
+    }
+
+    if (fileData) {
+      chatId = fields.chatId || fields.chat_id;
+      buffer = fileData.data;
+      mimeType = fileData.contentType || 'audio/ogg';
+      fileName = fileData.filename || 'voice.ogg';
+      caption = fields.caption || '';
+      voice = fields.voice === 'true' || fields.voice === true || fileName.endsWith('.ogg');
+      console.log(`📥 Recebido arquivo multipart: ${fileName} (${mimeType}, ${Math.round(buffer.length / 1024)}KB)`);
+    } else {
+      // No file in multipart, treat fields as JSON-like
+      chatId = fields.chatId || fields.chat_id;
+      const fileBase64 = fields.fileBase64;
+      mimeType = fields.mimeType || 'audio/ogg';
+      fileName = fields.fileName || 'voice.ogg';
+      caption = fields.caption || '';
+      voice = fields.voice === 'true';
+
+      if (!fileBase64) {
+        return res.status(400).json({ error: 'Envie o arquivo via multipart ou JSON (fileBase64)' });
+      }
+
+      let cleanBase64 = fileBase64;
+      if (cleanBase64.startsWith('data:')) {
+        const match = cleanBase64.match(/^data:[^;]+;base64,(.+)$/s);
+        if (match) cleanBase64 = match[1];
+      }
+      cleanBase64 = cleanBase64.replace(/[\s\r\n]+/g, '');
+      buffer = Buffer.from(cleanBase64, 'base64');
+    }
   } else {
-    // JSON body with base64 (legacy)
+    // JSON body with base64
     const body = req.body;
     chatId = body.chatId || body.chat_id;
     const fileBase64 = body.fileBase64;
@@ -1304,7 +1411,7 @@ app.post('/send-file/:botId', upload.single('message'), async (req, res) => {
     voice = body.voice === true;
 
     if (!fileBase64) {
-      return res.status(400).json({ error: 'Envie o arquivo via multipart (field "message") ou JSON (fileBase64)' });
+      return res.status(400).json({ error: 'Envie o arquivo via multipart ou JSON (fileBase64)' });
     }
 
     let cleanBase64 = fileBase64;
