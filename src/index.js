@@ -1274,9 +1274,47 @@ app.post('/user-status/:botId', async (req, res) => {
 });
 
 // Send file/audio via a specific bot (MTProto)
-app.post('/send-file/:botId', async (req, res) => {
+// Supports both JSON (fileBase64) and multipart form-data (file upload)
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+app.post('/send-file/:botId', upload.single('message'), async (req, res) => {
   const { botId } = req.params;
-  const { chatId, fileBase64, mimeType, fileName, caption, voice } = req.body;
+
+  // Support both multipart form-data and JSON body
+  let chatId, buffer, mimeType, fileName, caption, voice;
+
+  if (req.file) {
+    // Multipart form-data (from n8n binary upload)
+    chatId = req.body.chatId || req.body.chat_id;
+    buffer = req.file.buffer;
+    mimeType = req.file.mimetype || 'audio/ogg';
+    fileName = req.file.originalname || 'voice.ogg';
+    caption = req.body.caption || '';
+    voice = req.body.voice === 'true' || req.body.voice === true || fileName.endsWith('.ogg');
+    console.log(`📥 Recebido arquivo multipart: ${fileName} (${mimeType}, ${Math.round(buffer.length / 1024)}KB)`);
+  } else {
+    // JSON body with base64 (legacy)
+    const body = req.body;
+    chatId = body.chatId || body.chat_id;
+    const fileBase64 = body.fileBase64;
+    mimeType = body.mimeType || 'audio/ogg';
+    fileName = body.fileName || 'voice.ogg';
+    caption = body.caption || '';
+    voice = body.voice === true;
+
+    if (!fileBase64) {
+      return res.status(400).json({ error: 'Envie o arquivo via multipart (field "message") ou JSON (fileBase64)' });
+    }
+
+    let cleanBase64 = fileBase64;
+    if (cleanBase64.startsWith('data:')) {
+      const match = cleanBase64.match(/^data:[^;]+;base64,(.+)$/s);
+      if (match) cleanBase64 = match[1];
+    }
+    cleanBase64 = cleanBase64.replace(/[\s\r\n]+/g, '');
+    buffer = Buffer.from(cleanBase64, 'base64');
+  }
 
   const clientInfo = telegramClients.get(botId);
 
@@ -1288,55 +1326,13 @@ app.post('/send-file/:botId', async (req, res) => {
     return res.status(503).json({ error: 'Bot desconectado temporariamente' });
   }
 
-  if (!chatId || !fileBase64) {
-    return res.status(400).json({ error: 'chatId e fileBase64 são obrigatórios' });
+  if (!chatId || !buffer) {
+    return res.status(400).json({ error: 'chatId e arquivo são obrigatórios' });
   }
 
   try {
-    // Decode base64 to buffer
-    let cleanBase64 = fileBase64;
-    if (cleanBase64.startsWith('data:')) {
-      const match = cleanBase64.match(/^data:[^;]+;base64,(.+)$/s);
-      if (match) cleanBase64 = match[1];
-    }
-    cleanBase64 = cleanBase64.replace(/[\s\r\n]+/g, '');
+    console.log(`📤 [${clientInfo.botName}] Enviando ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType}) para chat ${chatId}`);
 
-    let buffer = Buffer.from(cleanBase64, 'base64');
-    console.log(`📤 [${clientInfo.botName}] Enviando arquivo ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType || 'unknown'}) para chat ${chatId}`);
-
-    // For voice notes, convert to OGG Opus using ffmpeg so Telegram treats it as voice
-    if (voice) {
-      const { execSync } = require('child_process');
-      const fs = require('fs');
-      const os = require('os');
-      const path = require('path');
-      
-      const tmpDir = os.tmpdir();
-      const inputExt = (mimeType || '').includes('mpeg') ? 'mp3' : 
-                       (mimeType || '').includes('wav') ? 'wav' : 
-                       (mimeType || '').includes('m4a') ? 'm4a' : 'mp3';
-      const inputPath = path.join(tmpDir, `voice_in_${Date.now()}.${inputExt}`);
-      const outputPath = path.join(tmpDir, `voice_out_${Date.now()}.ogg`);
-      
-      try {
-        fs.writeFileSync(inputPath, buffer);
-        // Convert to OGG Opus (required for Telegram voice notes)
-        execSync(`ffmpeg -i "${inputPath}" -c:a libopus -b:a 64k -vbr on -application voip -f ogg "${outputPath}" -y`, {
-          timeout: 30000,
-          stdio: 'pipe'
-        });
-        buffer = fs.readFileSync(outputPath);
-        console.log(`🔄 [${clientInfo.botName}] Convertido para OGG Opus: ${Math.round(buffer.length / 1024)}KB`);
-      } catch (ffmpegErr) {
-        console.warn(`⚠️ [${clientInfo.botName}] ffmpeg falhou, enviando original:`, ffmpegErr.message);
-        // Continue with original buffer if ffmpeg fails
-      } finally {
-        try { fs.unlinkSync(inputPath); } catch(e) {}
-        try { fs.unlinkSync(outputPath); } catch(e) {}
-      }
-    }
-
-    // Use sendFile for voice/audio
     const result = await clientInfo.client.sendFile(chatId, {
       file: buffer,
       caption: caption || '',
@@ -1346,7 +1342,7 @@ app.post('/send-file/:botId', async (req, res) => {
       attributes: voice ? [
         new Api.DocumentAttributeAudio({
           voice: true,
-          duration: 0, // Telegram will calculate
+          duration: 0,
           title: undefined,
           performer: undefined,
         })
@@ -1397,4 +1393,3 @@ process.on('SIGINT', async () => {
   
   process.exit(0);
 });
- 
