@@ -1301,26 +1301,56 @@ app.post('/send-file/:botId', async (req, res) => {
     }
     cleanBase64 = cleanBase64.replace(/[\s\r\n]+/g, '');
 
-    const buffer = Buffer.from(cleanBase64, 'base64');
+    let buffer = Buffer.from(cleanBase64, 'base64');
     console.log(`📤 [${clientInfo.botName}] Enviando arquivo ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType || 'unknown'}) para chat ${chatId}`);
 
-    // Build send attributes
-    const sendOptions = {
-      file: new Api.InputFile({
-        id: BigInt(Date.now()),
-        parts: 1,
-        name: fileName || 'audio.ogg',
-        md5Checksum: ''
-      }),
-    };
+    // For voice notes, convert to OGG Opus using ffmpeg so Telegram treats it as voice
+    if (voice) {
+      const { execSync } = require('child_process');
+      const fs = require('fs');
+      const os = require('os');
+      const path = require('path');
+      
+      const tmpDir = os.tmpdir();
+      const inputExt = (mimeType || '').includes('mpeg') ? 'mp3' : 
+                       (mimeType || '').includes('wav') ? 'wav' : 
+                       (mimeType || '').includes('m4a') ? 'm4a' : 'mp3';
+      const inputPath = path.join(tmpDir, `voice_in_${Date.now()}.${inputExt}`);
+      const outputPath = path.join(tmpDir, `voice_out_${Date.now()}.ogg`);
+      
+      try {
+        fs.writeFileSync(inputPath, buffer);
+        // Convert to OGG Opus (required for Telegram voice notes)
+        execSync(`ffmpeg -i "${inputPath}" -c:a libopus -b:a 64k -vbr on -application voip -f ogg "${outputPath}" -y`, {
+          timeout: 30000,
+          stdio: 'pipe'
+        });
+        buffer = fs.readFileSync(outputPath);
+        console.log(`🔄 [${clientInfo.botName}] Convertido para OGG Opus: ${Math.round(buffer.length / 1024)}KB`);
+      } catch (ffmpegErr) {
+        console.warn(`⚠️ [${clientInfo.botName}] ffmpeg falhou, enviando original:`, ffmpegErr.message);
+        // Continue with original buffer if ffmpeg fails
+      } finally {
+        try { fs.unlinkSync(inputPath); } catch(e) {}
+        try { fs.unlinkSync(outputPath); } catch(e) {}
+      }
+    }
 
     // Use sendFile for voice/audio
     const result = await clientInfo.client.sendFile(chatId, {
       file: buffer,
       caption: caption || '',
-      voiceNote: voice === true, // Send as voice note
-      fileName: fileName || (voice ? 'voice.ogg' : 'audio.mp3'),
-      mimeType: mimeType || 'audio/ogg',
+      voiceNote: voice === true,
+      fileName: voice ? 'voice.ogg' : (fileName || 'audio.mp3'),
+      mimeType: voice ? 'audio/ogg' : (mimeType || 'audio/ogg'),
+      attributes: voice ? [
+        new Api.DocumentAttributeAudio({
+          voice: true,
+          duration: 0, // Telegram will calculate
+          title: undefined,
+          performer: undefined,
+        })
+      ] : undefined,
     });
 
     console.log(`✅ [${clientInfo.botName}] Arquivo enviado, messageId: ${bigIntToString(result.id)}`);
