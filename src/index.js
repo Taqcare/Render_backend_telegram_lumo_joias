@@ -1342,7 +1342,7 @@ function parseMultipart(buf, boundary) {
 app.post('/send-file/:botId', async (req, res) => {
   const { botId } = req.params;
 
-  let chatId, buffer, mimeType, fileName, caption, voice;
+  let chatId, buffer, mimeType, fileName, caption, voice, spoiler;
 
   const contentType = req.headers['content-type'] || '';
 
@@ -1379,7 +1379,8 @@ app.post('/send-file/:botId', async (req, res) => {
       fileName = fileData.filename || 'voice.ogg';
       caption = fields.caption || '';
       voice = fields.voice === 'true' || fields.voice === true || fileName.endsWith('.ogg');
-      console.log(`📥 Recebido arquivo multipart: ${fileName} (${mimeType}, ${Math.round(buffer.length / 1024)}KB)`);
+      spoiler = fields.spoiler === 'true' || fields.spoiler === true;
+      console.log(`📥 Recebido arquivo multipart: ${fileName} (${mimeType}, ${Math.round(buffer.length / 1024)}KB, spoiler=${spoiler})`);
     } else {
       // No file in multipart, treat fields as JSON-like
       chatId = fields.chatId || fields.chat_id;
@@ -1388,6 +1389,7 @@ app.post('/send-file/:botId', async (req, res) => {
       fileName = fields.fileName || 'voice.ogg';
       caption = fields.caption || '';
       voice = fields.voice === 'true';
+      spoiler = fields.spoiler === 'true';
 
       if (!fileBase64) {
         return res.status(400).json({ error: 'Envie o arquivo via multipart ou JSON (fileBase64)' });
@@ -1410,6 +1412,7 @@ app.post('/send-file/:botId', async (req, res) => {
     fileName = body.fileName || 'voice.ogg';
     caption = body.caption || '';
     voice = body.voice === true;
+    spoiler = body.spoiler === true;
 
     if (!fileBase64) {
       return res.status(400).json({ error: 'Envie o arquivo via multipart ou JSON (fileBase64)' });
@@ -1439,7 +1442,7 @@ app.post('/send-file/:botId', async (req, res) => {
   }
 
   try {
-    console.log(`📤 [${clientInfo.botName}] Enviando ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType}) para chat ${chatId}`);
+    console.log(`📤 [${clientInfo.botName}] Enviando ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType}) para chat ${chatId}, spoiler=${!!spoiler}`);
 
     const finalFileName = voice ? 'voice.ogg' : (fileName || 'audio.mp3');
     const finalMimeType = voice ? 'audio/ogg' : (mimeType || 'audio/ogg');
@@ -1452,23 +1455,84 @@ app.post('/send-file/:botId', async (req, res) => {
       buffer
     );
 
-    const result = await clientInfo.client.sendFile(chatId, {
-      file: customFile,
-      caption: caption || '',
-      voiceNote: voice === true,
-      fileName: finalFileName,
-      mimeType: finalMimeType,
-      attributes: voice ? [
-        new Api.DocumentAttributeAudio({
-          voice: true,
-          duration: 0,
-          title: undefined,
-          performer: undefined,
-        })
-      ] : undefined,
-    });
+    let result;
 
-    console.log(`✅ [${clientInfo.botName}] Arquivo enviado, messageId: ${bigIntToString(result.id)}`);
+    if (spoiler && !voice) {
+      // Spoiler requires raw API - sendFile doesn't support it
+      // First upload the file
+      const uploadedFile = await clientInfo.client.uploadFile({
+        file: customFile,
+        workers: 1,
+      });
+
+      const isPhoto = finalMimeType.startsWith('image/');
+      const isVideo = finalMimeType.startsWith('video/');
+
+      let media;
+      if (isPhoto) {
+        media = new Api.InputMediaUploadedPhoto({
+          file: uploadedFile,
+          spoiler: true,
+        });
+      } else {
+        const attrs = [];
+        if (isVideo) {
+          attrs.push(new Api.DocumentAttributeVideo({
+            supportsStreaming: true,
+            duration: 0,
+            w: 0,
+            h: 0,
+          }));
+        }
+        attrs.push(new Api.DocumentAttributeFilename({
+          fileName: finalFileName,
+        }));
+
+        media = new Api.InputMediaUploadedDocument({
+          file: uploadedFile,
+          mimeType: finalMimeType,
+          attributes: attrs,
+          spoiler: true,
+        });
+      }
+
+      const peer = await clientInfo.client.getInputEntity(chatId);
+      const sendResult = await clientInfo.client.invoke(
+        new Api.messages.SendMedia({
+          peer: peer,
+          media: media,
+          message: caption || '',
+          randomId: BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)),
+        })
+      );
+
+      // Extract message ID from result
+      const msgId = sendResult.updates
+        ? sendResult.updates.find(u => u.className === 'UpdateMessageID')?.id
+        : sendResult.id;
+
+      result = { id: msgId || Date.now() };
+      console.log(`✅ [${clientInfo.botName}] Arquivo com spoiler enviado, messageId: ${bigIntToString(result.id)}`);
+    } else {
+      // Normal send without spoiler
+      result = await clientInfo.client.sendFile(chatId, {
+        file: customFile,
+        caption: caption || '',
+        voiceNote: voice === true,
+        fileName: finalFileName,
+        mimeType: finalMimeType,
+        attributes: voice ? [
+          new Api.DocumentAttributeAudio({
+            voice: true,
+            duration: 0,
+            title: undefined,
+            performer: undefined,
+          })
+        ] : undefined,
+      });
+
+      console.log(`✅ [${clientInfo.botName}] Arquivo enviado, messageId: ${bigIntToString(result.id)}`);
+    }
 
     res.json({
       success: true,
