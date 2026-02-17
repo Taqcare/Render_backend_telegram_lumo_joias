@@ -9,6 +9,7 @@ const express = require('express');
 const { TelegramClient, Api } = require('telegram');
 const { NewMessage } = require('telegram/events');
 const { StringSession } = require('telegram/sessions');
+const { CustomFile } = require('telegram/client/uploads');
 const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
 const https = require('https');
@@ -1440,12 +1441,23 @@ app.post('/send-file/:botId', async (req, res) => {
   try {
     console.log(`📤 [${clientInfo.botName}] Enviando ${voice ? 'voice' : 'file'}: ${Math.round(buffer.length / 1024)}KB (${mimeType}) para chat ${chatId}`);
 
+    const finalFileName = voice ? 'voice.ogg' : (fileName || 'audio.mp3');
+    const finalMimeType = voice ? 'audio/ogg' : (mimeType || 'audio/ogg');
+
+    // Wrap buffer in CustomFile so GramJS knows the file name and size
+    const customFile = new CustomFile(
+      finalFileName,
+      buffer.length,
+      '',      // no path, buffer is used directly
+      buffer
+    );
+
     const result = await clientInfo.client.sendFile(chatId, {
-      file: buffer,
+      file: customFile,
       caption: caption || '',
       voiceNote: voice === true,
-      fileName: voice ? 'voice.ogg' : (fileName || 'audio.mp3'),
-      mimeType: voice ? 'audio/ogg' : (mimeType || 'audio/ogg'),
+      fileName: finalFileName,
+      mimeType: finalMimeType,
       attributes: voice ? [
         new Api.DocumentAttributeAudio({
           voice: true,
